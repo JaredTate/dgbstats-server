@@ -8,9 +8,9 @@ const app = express();
 const port = process.env.PORT || 5001;
 
 // Replace with your DigiByte RPC credentials and URL
-const rpcUser = 'dgbuser';
-const rpcPassword = 'dgbpassword';
-const rpcUrl = 'http://127.0.0.1:14022';
+const rpcUser = 'user';
+const rpcPassword = 'password';
+const rpcUrl = 'http://127.0.0.1:14044';
 
 app.use(cors());
 app.use(express.json());
