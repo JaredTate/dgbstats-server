@@ -152,8 +152,7 @@ const fetchSeedNodes = async () => {
       };
     });
 
-    cachedData = [...cachedData, ...newGeoData];
-    cachedData = [...new Set(cachedData.map(JSON.stringify))].map(JSON.parse);
+    cachedData = [...new Set([...cachedData, ...newGeoData])];
     lastFetchTime = Date.now();
   } catch (error) {
     console.error('Error fetching seed nodes:', error);
