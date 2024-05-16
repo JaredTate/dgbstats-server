@@ -2,27 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
 const { router: rpcRoutes, sendRpcRequest, getAlgoName } = require('./rpc');
-const https = require('https');
-const fs = require('fs');
 
 const app = express();
 const port = process.env.PORT || 5001;
-
-// Load SSL/TLS certificates
-const options = {
-  key: fs.readFileSync('/etc/letsencrypt/live/digibyte.io/privkey.pem'),
-  cert: fs.readFileSync('/etc/letsencrypt/live/digibyte.io/fullchain.pem'),
-};
-
-// Create an HTTPS server
-const server = https.createServer(options, app);
 
 app.use(cors());
 app.use(express.json());
 app.use('/api', rpcRoutes);
 
-const wss = new WebSocket.Server({ server });
-
+const wss = new WebSocket.Server({ port: 5002 });
 const recentBlocks = [];
 const maxRecentBlocks = 25;
 const pingInterval = 30000; // Send a ping every 30 seconds
@@ -127,6 +115,6 @@ app.post('/api/blocknotify', async (req, res) => {
   }
 });
 
-server.listen(port, () => {
-  console.log(`Server listening at https://localhost:${port}`);
+app.listen(port, () => {
+  console.log(`Server listening at http://localhost:${port}`);
 });
