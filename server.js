@@ -103,7 +103,7 @@ app.post('/api/blocknotify', async (req, res) => {
     // Notify connected WebSocket clients
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
-        console.log('Sending block data to client:', newBlock);
+        console.log('Sending new block to client:', newBlock);
         client.send(JSON.stringify({ type: 'newBlock', data: newBlock }));
       }
     });
