@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
+const dns = require('dns');
+const geoip = require('geoip-lite');
 const { router: rpcRoutes, sendRpcRequest, getAlgoName } = require('./rpc');
 
 const app = express();
@@ -114,6 +116,61 @@ app.post('/api/blocknotify', async (req, res) => {
     res.sendStatus(500);
   }
 });
+
+const cacheDuration = 60 * 60 * 1000; // 1 hour in milliseconds
+const fetchInterval = 15 * 1000; // 15 seconds in milliseconds
+let cachedData = [];
+let lastFetchTime = 0;
+
+app.get('/api/seedNodes', async (req, res) => {
+  res.json(cachedData);
+});
+
+const fetchSeedNodes = async () => {
+  try {
+    const addresses = await new Promise((resolve, reject) => {
+      dns.resolveAny('seed.digibyte.io', (err, addresses) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(addresses);
+        }
+      });
+    });
+
+    const newAddresses = addresses.filter((address) => address.type === 'A');
+    const uniqueAddresses = newAddresses.filter((address) => !cachedData.some((node) => node.ip === address.address));
+
+    const newGeoData = uniqueAddresses.map((address) => {
+      const geo = geoip.lookup(address.address);
+      return {
+        ip: address.address,
+        country: geo?.country || 'Unknown',
+        city: geo?.city || 'Unknown',
+        lat: geo?.ll[0] || 0,
+        lon: geo?.ll[1] || 0,
+      };
+    });
+
+    cachedData = [...cachedData, ...newGeoData];
+    cachedData = [...new Set(cachedData.map(JSON.stringify))].map(JSON.parse);
+    lastFetchTime = Date.now();
+  } catch (error) {
+    console.error('Error fetching seed nodes:', error);
+  }
+};
+
+const startFetchingData = () => {
+  setInterval(async () => {
+    const currentTime = Date.now();
+    if (currentTime - lastFetchTime >= cacheDuration) {
+      cachedData = []; // Clear the cache if it's expired
+    }
+    await fetchSeedNodes();
+  }, fetchInterval);
+};
+
+startFetchingData();
 
 app.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}`);
