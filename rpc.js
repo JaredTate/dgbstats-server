@@ -1,7 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const geoip = require('geoip-lite');
-
 const router = express.Router();
 
 // Replace with your DigiByte RPC credentials and URL
@@ -26,7 +25,6 @@ const sendRpcRequest = async (method, params = []) => {
         },
       }
     );
-
     return response.data.result;
   } catch (error) {
     console.error('Error sending RPC request:', error.message);
@@ -52,6 +50,31 @@ function getAlgoName(algo) {
   }
 }
 
+async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
+  const blocks = [];
+  let currentBlockHash = await sendRpcRequest('getblockhash', [endBlockHeight]);
+
+  while (true) {
+    const block = await sendRpcRequest('getblock', [currentBlockHash]);
+    if (block.time < startTimestamp) {
+      break;
+    }
+
+    blocks.push({
+      height: block.height,
+      hash: block.hash,
+      algo: getAlgoName(block.pow_algo),
+      txCount: block.nTx,
+      difficulty: block.difficulty,
+      timestamp: block.time,
+    });
+
+    currentBlockHash = block.previousblockhash;
+  }
+
+  return blocks;
+}
+
 router.get('/getblockchaininfo', async (req, res) => {
   try {
     const data = await sendRpcRequest('getblockchaininfo');
@@ -65,7 +88,6 @@ router.get('/getblockchaininfo', async (req, res) => {
 router.get('/getpeerinfo', async (req, res) => {
   try {
     const data = await sendRpcRequest('getpeerinfo');
-    
     const nodesWithGeoData = data.map((node) => {
       const ip = node.addr.split(':')[0];
       const geo = geoip.lookup(ip) || {};
@@ -73,12 +95,11 @@ router.get('/getpeerinfo', async (req, res) => {
         ...node,
         lat: geo.ll && geo.ll[0],
         lon: geo.ll && geo.ll[1],
-        city: geo.city, // Add city information
-        country: geo.country, // Add country information
+        city: geo.city,
+        country: geo.country,
       };
       return newNode;
     });
-    
     res.json(nodesWithGeoData);
   } catch (error) {
     console.error('Error in /api/getpeerinfo:', error);
@@ -102,20 +123,17 @@ router.get('/getlatestblock', async (req, res) => {
     if (!latestBlockHash) {
       throw new Error('Failed to fetch latest block hash');
     }
-    
     const block = await sendRpcRequest('getblock', [latestBlockHash]);
     if (!block) {
       throw new Error('Failed to fetch block data');
     }
-    
     const latestBlockInfo = {
       height: block.height,
       hash: block.hash,
       algo: block.pow_algo,
       txCount: block.nTx,
-      difficulty: block.difficulty, // Add this line
+      difficulty: block.difficulty,
     };
-    
     res.json(latestBlockInfo);
   } catch (error) {
     console.error('Error fetching latest block:', error);
@@ -144,7 +162,8 @@ router.get('/gettxoutsetinfo', async (req, res) => {
 });
 
 module.exports = {
-    router,
-    sendRpcRequest,
-    getAlgoName,
-  };
+  router,
+  sendRpcRequest,
+  getAlgoName,
+  getBlocksByTimeRange,
+};

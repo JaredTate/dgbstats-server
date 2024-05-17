@@ -5,7 +5,7 @@ const dns = require('dns');
 const geoip = require('geoip-lite');
 const NodeCache = require('node-cache');
 const sqlite3 = require('sqlite3').verbose();
-const { router: rpcRoutes, sendRpcRequest, getAlgoName } = require('./rpc');
+const { router: rpcRoutes, sendRpcRequest, getAlgoName, getBlocksByTimeRange } = require('./rpc');
 
 const app = express();
 const port = process.env.PORT || 5001;
@@ -16,7 +16,7 @@ app.use('/api', rpcRoutes);
 
 const wss = new WebSocket.Server({ port: 5002 });
 const recentBlocks = [];
-const maxRecentBlocks = 25;
+const maxRecentBlocks = 240;
 const pingInterval = 30000; // Send a ping every 30 seconds
 
 const cache = new NodeCache({ stdTTL: 60 }); // Cache data for 1 minute
@@ -65,7 +65,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-
 // Function to fetch the latest blocks from the server and store them in the recentBlocks array
 async function fetchLatestBlocks() {
   try {
@@ -75,24 +74,12 @@ async function fetchLatestBlocks() {
     console.log('Latest block height:', latestBlockHeight);
 
     // Fetch the most recent blocks
-    for (let i = 0; i < maxRecentBlocks; i++) {
-      const blockHeight = latestBlockHeight - i;
-      if (blockHeight < 0) break;
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+    const blocks = await getBlocksByTimeRange(oneHourAgo, latestBlockHeight);
 
-      const blockHash = await sendRpcRequest('getblockhash', [blockHeight]);
-      const block = await sendRpcRequest('getblock', [blockHash]);
-
-      const newBlock = {
-        height: block.height,
-        hash: block.hash,
-        algo: getAlgoName(block.pow_algo),
-        txCount: block.nTx,
-        difficulty: block.difficulty,
-      };
-
-      console.log('Fetched block:', newBlock);
-      recentBlocks.push(newBlock);
-    }
+    recentBlocks.push(...blocks);
+    recentBlocks.sort((a, b) => b.height - a.height);
+    recentBlocks.splice(maxRecentBlocks);
 
     console.log('Fetched recent blocks:', recentBlocks);
   } catch (error) {
@@ -157,15 +144,14 @@ app.post('/api/blocknotify', async (req, res) => {
       algo: getAlgoName(block.pow_algo),
       txCount: block.nTx,
       difficulty: block.difficulty,
+      timestamp: block.time,
     };
 
     console.log('New block data:', newBlock);
 
     // Store the new block in the recentBlocks array
     recentBlocks.unshift(newBlock);
-    if (recentBlocks.length > maxRecentBlocks) {
-      recentBlocks.pop();
-    }
+    recentBlocks.splice(maxRecentBlocks);
 
     // Notify connected WebSocket clients
     wss.clients.forEach((client) => {
