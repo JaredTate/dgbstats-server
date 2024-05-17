@@ -21,6 +21,9 @@ const pingInterval = 30000; // Send a ping every 30 seconds
 
 const cache = new NodeCache({ stdTTL: 60 }); // Cache data for 1 minute
 
+// Create a SQLite database connection
+const db = new sqlite3.Database('nodes.db');
+
 // Create a table to store unique IPs if it doesn't exist
 db.run(`CREATE TABLE IF NOT EXISTS nodes (
   ip TEXT PRIMARY KEY,
@@ -29,9 +32,6 @@ db.run(`CREATE TABLE IF NOT EXISTS nodes (
   lat REAL,
   lon REAL
 )`);
-
-// Add the timestamp column if it doesn't exist
-db.run(`ALTER TABLE nodes ADD COLUMN timestamp INTEGER`);
 
 let uniqueNodes = [];
 let lastUniqueNodesCount = 0;
