@@ -182,7 +182,7 @@ app.post('/api/blocknotify', async (req, res) => {
   }
 });
 
-const fetchInterval = 5 * 1000; // 5 seconds in milliseconds
+const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
 
 const fetchSeedNodes = async () => {
   try {
