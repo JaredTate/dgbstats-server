@@ -36,8 +36,12 @@ db.run(`CREATE TABLE IF NOT EXISTS nodes (
 let uniqueNodes = [];
 let lastUniqueNodesCount = 0;
 
+let connectedClients = 0;
+
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
+  connectedClients++;
+  console.log(`Number of connected clients: ${connectedClients}`);
 
   // Send the cached recent blocks to the new client
   console.log('Sending recent blocks to client:', recentBlocks);
@@ -61,6 +65,8 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('WebSocket client disconnected');
+    connectedClients--;
+    console.log(`Number of connected clients: ${connectedClients}`);
     clearInterval(pingTimer);
   });
 });
