@@ -3,6 +3,7 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const dns = require('dns');
 const geoip = require('geoip-lite');
+const NodeCache = require('node-cache');
 const { router: rpcRoutes, sendRpcRequest, getAlgoName } = require('./rpc');
 
 const app = express();
@@ -17,12 +18,28 @@ const recentBlocks = [];
 const maxRecentBlocks = 25;
 const pingInterval = 30000; // Send a ping every 30 seconds
 
+let uniqueIPs = new Set();
+let cachedGeoData = [];
+
+const cache = new NodeCache({ stdTTL: 60 }); // Cache data for 1 minute
+
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
 
   // Send the cached recent blocks to the new client
   console.log('Sending recent blocks to client:', recentBlocks);
   ws.send(JSON.stringify({ type: 'recentBlocks', data: recentBlocks }));
+
+  // Send the current cached geo data to the new client
+  console.log('Sending current cached geo data to client:', cachedGeoData);
+  ws.send(JSON.stringify({ type: 'geoData', data: cachedGeoData }));
+
+  // Send the cached initial data to the new client
+  const initialData = cache.get('initialData');
+  if (initialData) {
+    console.log('Sending initial data to client:', initialData);
+    ws.send(JSON.stringify({ type: 'initialData', data: initialData }));
+  }
 
   // Send ping messages to keep the connection alive
   const pingTimer = setInterval(() => {
@@ -72,6 +89,40 @@ async function fetchLatestBlocks() {
 // Fetch the latest blocks when the server starts
 fetchLatestBlocks();
 
+const fetchInitialData = async () => {
+  try {
+    const blockchainInfo = await sendRpcRequest('getblockchaininfo');
+    const chainTxStats = await sendRpcRequest('getchaintxstats');
+    const txOutsetInfo = await sendRpcRequest('gettxoutsetinfo');
+    const blockRewardResponse = await sendRpcRequest('getblockreward');
+    const blockReward = parseFloat(blockRewardResponse.blockreward);
+
+    const initialData = {
+      blockchainInfo,
+      chainTxStats,
+      txOutsetInfo,
+      blockReward,
+    };
+
+    cache.set('initialData', initialData);
+
+    // Send the updated initial data to all connected clients
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'initialData', data: initialData }));
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching initial data:', error);
+  }
+};
+
+// Fetch initial data when the server starts
+fetchInitialData();
+
+// Fetch initial data every 1 minute
+setInterval(fetchInitialData, 60000);
+
 app.post('/api/blocknotify', async (req, res) => {
   try {
     if (!req.body) {
@@ -119,17 +170,15 @@ app.post('/api/blocknotify', async (req, res) => {
 
 const cacheDuration = 60 * 60 * 1000; // 1 hour in milliseconds
 const fetchInterval = 15 * 1000; // 15 seconds in milliseconds
-let cachedData = [];
 let lastFetchTime = 0;
 
-app.get('/api/seedNodes', async (req, res) => {
-  res.json(cachedData);
-});
-
 const fetchSeedNodes = async () => {
+  let uniqueIPs = new Set();
+  let cachedGeoData = [];
+
   try {
     const addresses = await new Promise((resolve, reject) => {
-      dns.resolveAny('seed.digibyte.io', (err, addresses) => {
+      dns.resolve4('seed.digibyte.io', (err, addresses) => {
         if (err) {
           reject(err);
         } else {
@@ -138,13 +187,18 @@ const fetchSeedNodes = async () => {
       });
     });
 
-    const newAddresses = addresses.filter((address) => address.type === 'A');
-    const uniqueAddresses = newAddresses.filter((address) => !cachedData.some((node) => node.ip === address.address));
+    console.log('Fetched addresses:', addresses);
 
-    const newGeoData = uniqueAddresses.map((address) => {
-      const geo = geoip.lookup(address.address);
+    // Add the fetched IPs to the uniqueIPs set
+    addresses.forEach((ip) => uniqueIPs.add(ip));
+
+    console.log('Unique IPs:', uniqueIPs);
+
+    // Create new geo data array
+    const newGeoData = Array.from(uniqueIPs).map((ip) => {
+      const geo = geoip.lookup(ip);
       return {
-        ip: address.address,
+        ip,
         country: geo?.country || 'Unknown',
         city: geo?.city || 'Unknown',
         lat: geo?.ll[0] || 0,
@@ -152,7 +206,21 @@ const fetchSeedNodes = async () => {
       };
     });
 
-    cachedData = [...new Set([...cachedData, ...newGeoData])];
+    console.log('New geo data:', newGeoData);
+
+    // Check if there are any changes in the geo data
+    if (JSON.stringify(newGeoData) !== JSON.stringify(cachedGeoData)) {
+      // Update the cached geo data
+      cachedGeoData = newGeoData;
+
+      // Send the updated geo data to the connected clients
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: 'geoData', data: cachedGeoData }));
+        }
+      });
+    }
+
     lastFetchTime = Date.now();
   } catch (error) {
     console.error('Error fetching seed nodes:', error);
@@ -161,10 +229,6 @@ const fetchSeedNodes = async () => {
 
 const startFetchingData = () => {
   setInterval(async () => {
-    const currentTime = Date.now();
-    if (currentTime - lastFetchTime >= cacheDuration) {
-      cachedData = []; // Clear the cache if it's expired
-    }
     await fetchSeedNodes();
   }, fetchInterval);
 };
