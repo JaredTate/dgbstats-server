@@ -33,6 +33,9 @@ db.run(`CREATE TABLE IF NOT EXISTS nodes (
   lon REAL
 )`);
 
+// Add the timestamp column if it doesn't exist
+db.run(`ALTER TABLE nodes ADD COLUMN timestamp INTEGER`);
+
 let uniqueNodes = [];
 let lastUniqueNodesCount = 0;
 
