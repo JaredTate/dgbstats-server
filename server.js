@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const dns = require('dns');
 const geoip = require('geoip-lite');
 const NodeCache = require('node-cache');
+const sqlite3 = require('sqlite3').verbose();
 const { router: rpcRoutes, sendRpcRequest, getAlgoName } = require('./rpc');
 
 const app = express();
@@ -18,10 +19,19 @@ const recentBlocks = [];
 const maxRecentBlocks = 25;
 const pingInterval = 30000; // Send a ping every 30 seconds
 
-let uniqueIPs = new Set();
-let cachedGeoData = [];
-
 const cache = new NodeCache({ stdTTL: 60 }); // Cache data for 1 minute
+
+// Create a SQLite database connection
+const db = new sqlite3.Database('nodes.db');
+
+// Create a table to store unique IPs if it doesn't exist
+db.run(`CREATE TABLE IF NOT EXISTS nodes (
+  ip TEXT PRIMARY KEY,
+  country TEXT,
+  city TEXT,
+  lat REAL,
+  lon REAL
+)`);
 
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
@@ -29,10 +39,6 @@ wss.on('connection', (ws) => {
   // Send the cached recent blocks to the new client
   console.log('Sending recent blocks to client:', recentBlocks);
   ws.send(JSON.stringify({ type: 'recentBlocks', data: recentBlocks }));
-
-  // Send the current cached geo data to the new client
-  console.log('Sending current cached geo data to client:', cachedGeoData);
-  ws.send(JSON.stringify({ type: 'geoData', data: cachedGeoData }));
 
   // Send the cached initial data to the new client
   const initialData = cache.get('initialData');
@@ -168,14 +174,9 @@ app.post('/api/blocknotify', async (req, res) => {
   }
 });
 
-const cacheDuration = 60 * 60 * 1000; // 1 hour in milliseconds
 const fetchInterval = 15 * 1000; // 15 seconds in milliseconds
-let lastFetchTime = 0;
 
 const fetchSeedNodes = async () => {
-  let uniqueIPs = new Set();
-  let cachedGeoData = [];
-
   try {
     const addresses = await new Promise((resolve, reject) => {
       dns.resolve4('seed.digibyte.io', (err, addresses) => {
@@ -189,39 +190,33 @@ const fetchSeedNodes = async () => {
 
     console.log('Fetched addresses:', addresses);
 
-    // Add the fetched IPs to the uniqueIPs set
-    addresses.forEach((ip) => uniqueIPs.add(ip));
+    // Insert or update the fetched IPs in the database
+    const stmt = db.prepare(`INSERT OR REPLACE INTO nodes (ip, country, city, lat, lon)
+      VALUES (?, ?, ?, ?, ?)`);
 
-    console.log('Unique IPs:', uniqueIPs);
-
-    // Create new geo data array
-    const newGeoData = Array.from(uniqueIPs).map((ip) => {
+    addresses.forEach((ip) => {
       const geo = geoip.lookup(ip);
-      return {
-        ip,
-        country: geo?.country || 'Unknown',
-        city: geo?.city || 'Unknown',
-        lat: geo?.ll[0] || 0,
-        lon: geo?.ll[1] || 0,
-      };
+      stmt.run(ip, geo?.country || 'Unknown', geo?.city || 'Unknown', geo?.ll[0] || 0, geo?.ll[1] || 0);
     });
 
-    console.log('New geo data:', newGeoData);
+    stmt.finalize();
 
-    // Check if there are any changes in the geo data
-    if (JSON.stringify(newGeoData) !== JSON.stringify(cachedGeoData)) {
-      // Update the cached geo data
-      cachedGeoData = newGeoData;
+    // Retrieve all unique IPs from the database
+    db.all('SELECT * FROM nodes', (err, rows) => {
+      if (err) {
+        console.error('Error retrieving nodes from database:', err);
+        return;
+      }
+
+      console.log('Unique IPs from database:', rows);
 
       // Send the updated geo data to the connected clients
       wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'geoData', data: cachedGeoData }));
+          client.send(JSON.stringify({ type: 'geoData', data: rows }));
         }
       });
-    }
-
-    lastFetchTime = Date.now();
+    });
   } catch (error) {
     console.error('Error fetching seed nodes:', error);
   }
