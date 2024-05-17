@@ -33,6 +33,9 @@ db.run(`CREATE TABLE IF NOT EXISTS nodes (
   lon REAL
 )`);
 
+let uniqueNodes = [];
+let lastUniqueNodesCount = 0;
+
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
 
@@ -47,6 +50,10 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ type: 'initialData', data: initialData }));
   }
 
+  // Send all unique nodes to the new client
+  console.log('Sending all unique nodes to client:', uniqueNodes);
+  ws.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
+
   // Send ping messages to keep the connection alive
   const pingTimer = setInterval(() => {
     ws.ping();
@@ -57,6 +64,7 @@ wss.on('connection', (ws) => {
     clearInterval(pingTimer);
   });
 });
+
 
 // Function to fetch the latest blocks from the server and store them in the recentBlocks array
 async function fetchLatestBlocks() {
@@ -174,7 +182,7 @@ app.post('/api/blocknotify', async (req, res) => {
   }
 });
 
-const fetchInterval = 15 * 1000; // 15 seconds in milliseconds
+const fetchInterval = 5 * 1000; // 5 seconds in milliseconds
 
 const fetchSeedNodes = async () => {
   try {
@@ -191,29 +199,38 @@ const fetchSeedNodes = async () => {
     console.log('Fetched addresses:', addresses);
 
     // Insert or update the fetched IPs in the database
-    const stmt = db.prepare(`INSERT OR REPLACE INTO nodes (ip, country, city, lat, lon)
-      VALUES (?, ?, ?, ?, ?)`);
+    const stmt = db.prepare(`INSERT OR REPLACE INTO nodes (ip, country, city, lat, lon, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?)`);
 
     addresses.forEach((ip) => {
       const geo = geoip.lookup(ip);
-      stmt.run(ip, geo?.country || 'Unknown', geo?.city || 'Unknown', geo?.ll[0] || 0, geo?.ll[1] || 0);
+      stmt.run(ip, geo?.country || 'Unknown', geo?.city || 'Unknown', geo?.ll[0] || 0, geo?.ll[1] || 0, Date.now());
     });
 
     stmt.finalize();
 
-    // Retrieve all unique IPs from the database
+    // Retrieve all unique nodes from the database
     db.all('SELECT * FROM nodes', (err, rows) => {
       if (err) {
         console.error('Error retrieving nodes from database:', err);
         return;
       }
 
-      console.log('Unique IPs from database:', rows);
+      console.log('All unique nodes:', rows);
+      uniqueNodes = rows;
+
+      // Check if the number of unique nodes has increased
+      if (uniqueNodes.length > lastUniqueNodesCount) {
+        console.log(`Unique nodes count increased from ${lastUniqueNodesCount} to ${uniqueNodes.length}`);
+        lastUniqueNodesCount = uniqueNodes.length;
+      } else {
+        console.log(`Unique nodes count remains at ${uniqueNodes.length}`);
+      }
 
       // Send the updated geo data to the connected clients
       wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'geoData', data: rows }));
+          client.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
         }
       });
     });
