@@ -126,8 +126,8 @@ const fetchInitialData = async () => {
 // Fetch initial data when the server starts
 fetchInitialData();
 
-// Fetch initial data every 1 minute
-setInterval(fetchInitialData, 60000);
+// Fetch initial data every 30 Seconds
+setInterval(fetchInitialData, 30000);
 
 // server.js
 app.post('/api/blocknotify', async (req, res) => {
