@@ -55,9 +55,28 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
   let currentBlockHash = await sendRpcRequest('getblockhash', [endBlockHeight]);
 
   while (true) {
-    const block = await sendRpcRequest('getblock', [currentBlockHash]);
+    const block = await sendRpcRequest('getblock', [currentBlockHash, 2]);
     if (block.time < startTimestamp) {
       break;
+    }
+
+    let minedTo = '';
+    let poolIdentifier = 'Unknown';
+
+    if (block.tx && block.tx.length > 0) {
+      const coinbaseTx = block.tx[0];
+      if (coinbaseTx.vout && coinbaseTx.vout.length > 0 && coinbaseTx.vout[0].scriptPubKey && coinbaseTx.vout[0].scriptPubKey.addresses) {
+        minedTo = coinbaseTx.vout[0].scriptPubKey.addresses[0];
+      }
+
+      // Extract pool identifier from coinbase transaction
+      const coinbaseHex = coinbaseTx.vin[0].coinbase;
+      const decodedCoinbase = Buffer.from(coinbaseHex, 'hex').toString('ascii');
+      const poolIdentifierRegex = /\/(.*)\//;
+      const match = decodedCoinbase.match(poolIdentifierRegex);
+      if (match && match[1]) {
+        poolIdentifier = match[1];
+      }
     }
 
     blocks.push({
@@ -67,6 +86,8 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
       txCount: block.nTx,
       difficulty: block.difficulty,
       timestamp: block.time,
+      minedTo,
+      poolIdentifier,
     });
 
     currentBlockHash = block.previousblockhash;
@@ -74,7 +95,6 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
 
   return blocks;
 }
-
 router.get('/getblockchaininfo', async (req, res) => {
   try {
     const data = await sendRpcRequest('getblockchaininfo');
@@ -113,7 +133,7 @@ router.get('/getblockreward', async (req, res) => {
     res.json({ blockReward: data });
   } catch (error) {
     console.error('Error in /api/getblockreward:', error);
-    res.status(500).json({ error: 'Error fetching transaction output set info' });
+    res.status(500).json({ error: 'Error fetching block reward' });
   }
 });
 

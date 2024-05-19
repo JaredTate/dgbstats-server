@@ -93,6 +93,7 @@ async function fetchLatestBlocks() {
   }
 }
 
+
 // Fetch the latest blocks when the server starts
 fetchLatestBlocks();
 
@@ -139,9 +140,28 @@ app.post('/api/blocknotify', async (req, res) => {
     const blockHash = req.body.blockhash;
     console.log('Received block notification for:', blockHash);
 
-    const block = await sendRpcRequest('getblock', [blockHash]);
+    const block = await sendRpcRequest('getblock', [blockHash, 2]);
     if (!block) {
       throw new Error('Failed to fetch block data');
+    }
+
+    let minedTo = '';
+    let poolIdentifier = 'Unknown';
+
+    if (block.tx && block.tx.length > 0) {
+      const coinbaseTx = block.tx[0];
+      if (coinbaseTx.vout && coinbaseTx.vout.length > 0 && coinbaseTx.vout[0].scriptPubKey && coinbaseTx.vout[0].scriptPubKey.addresses) {
+        minedTo = coinbaseTx.vout[0].scriptPubKey.addresses[0];
+      }
+
+      // Extract pool identifier from coinbase transaction
+      const coinbaseHex = coinbaseTx.vin[0].coinbase;
+      const decodedCoinbase = Buffer.from(coinbaseHex, 'hex').toString('ascii');
+      const poolIdentifierRegex = /\/(.*)\//;
+      const match = decodedCoinbase.match(poolIdentifierRegex);
+      if (match && match[1]) {
+        poolIdentifier = match[1];
+      }
     }
 
     const newBlock = {
@@ -151,6 +171,8 @@ app.post('/api/blocknotify', async (req, res) => {
       txCount: block.nTx,
       difficulty: block.difficulty,
       timestamp: block.time,
+      minedTo,
+      poolIdentifier,
     };
 
     console.log('New block data:', newBlock);
