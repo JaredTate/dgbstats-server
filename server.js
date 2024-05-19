@@ -92,8 +92,6 @@ async function fetchLatestBlocks() {
     console.error('Error fetching latest blocks:', error);
   }
 }
-
-
 // Fetch the latest blocks when the server starts
 fetchLatestBlocks();
 
@@ -131,6 +129,7 @@ fetchInitialData();
 // Fetch initial data every 1 minute
 setInterval(fetchInitialData, 60000);
 
+// server.js
 app.post('/api/blocknotify', async (req, res) => {
   try {
     if (!req.body) {
@@ -142,7 +141,9 @@ app.post('/api/blocknotify', async (req, res) => {
 
     const block = await sendRpcRequest('getblock', [blockHash, 2]);
     if (!block) {
-      throw new Error('Failed to fetch block data');
+      console.error(`Failed to fetch block data for block hash: ${blockHash}`);
+      res.sendStatus(200);
+      return;
     }
 
     let minedTo = '';
@@ -150,8 +151,8 @@ app.post('/api/blocknotify', async (req, res) => {
 
     if (block.tx && block.tx.length > 0) {
       const coinbaseTx = block.tx[0];
-      if (coinbaseTx.vout && coinbaseTx.vout.length > 0 && coinbaseTx.vout[0].scriptPubKey && coinbaseTx.vout[0].scriptPubKey.addresses) {
-        minedTo = coinbaseTx.vout[0].scriptPubKey.addresses[0];
+      if (coinbaseTx.vout && coinbaseTx.vout.length > 1 && coinbaseTx.vout[1].scriptPubKey && coinbaseTx.vout[1].scriptPubKey.address) {
+        minedTo = coinbaseTx.vout[1].scriptPubKey.address;
       }
 
       // Extract pool identifier from coinbase transaction
@@ -195,7 +196,6 @@ app.post('/api/blocknotify', async (req, res) => {
     res.sendStatus(500);
   }
 });
-
 const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
 
 const fetchSeedNodes = async () => {

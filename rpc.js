@@ -25,10 +25,15 @@ const sendRpcRequest = async (method, params = []) => {
         },
       }
     );
+
+    if (response.data.error) {
+      throw new Error(`RPC Error: ${JSON.stringify(response.data.error)}`);
+    }
+
     return response.data.result;
   } catch (error) {
     console.error('Error sending RPC request:', error.message);
-    console.error('Error details:', error.response.data);
+    console.error('Error details:', error.response ? JSON.stringify(error.response.data) : error);
     return null;
   }
 };
@@ -54,8 +59,16 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
   const blocks = [];
   let currentBlockHash = await sendRpcRequest('getblockhash', [endBlockHeight]);
 
-  while (true) {
+  while (currentBlockHash) {
     const block = await sendRpcRequest('getblock', [currentBlockHash, 2]);
+
+    if (!block) {
+      console.error(`Failed to fetch block data for block hash: ${currentBlockHash}`);
+      currentBlockHash = await sendRpcRequest('getblockhash', [endBlockHeight - 1]);
+      endBlockHeight--;
+      continue;
+    }
+
     if (block.time < startTimestamp) {
       break;
     }
@@ -65,8 +78,8 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
 
     if (block.tx && block.tx.length > 0) {
       const coinbaseTx = block.tx[0];
-      if (coinbaseTx.vout && coinbaseTx.vout.length > 0 && coinbaseTx.vout[0].scriptPubKey && coinbaseTx.vout[0].scriptPubKey.addresses) {
-        minedTo = coinbaseTx.vout[0].scriptPubKey.addresses[0];
+      if (coinbaseTx.vout && coinbaseTx.vout.length > 1 && coinbaseTx.vout[1].scriptPubKey && coinbaseTx.vout[1].scriptPubKey.address) {
+        minedTo = coinbaseTx.vout[1].scriptPubKey.address;
       }
 
       // Extract pool identifier from coinbase transaction
@@ -95,6 +108,7 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight) {
 
   return blocks;
 }
+
 router.get('/getblockchaininfo', async (req, res) => {
   try {
     const data = await sendRpcRequest('getblockchaininfo');
