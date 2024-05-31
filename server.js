@@ -319,30 +319,52 @@ app.use((req, res, next) => {
     if (err) {
       console.error('Error inserting visit log:', err);
     }
-    // Check if the IP address is unique and insert it into the unique_ips table
-    db.run('INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)', [ip], (err) => {
+    // Check if the IP address is already in the unique_ips table
+    db.get('SELECT COUNT(*) AS count FROM unique_ips WHERE ip = ?', [ip], (err, row) => {
       if (err) {
-        console.error('Error inserting unique IP:', err);
+        console.error('Error checking unique IP:', err);
+        return next();
       }
-      next();
+      if (row.count === 0) {
+        // IP address is unique, insert it into the unique_ips table
+        db.run('INSERT INTO unique_ips (ip) VALUES (?)', [ip], (err) => {
+          if (err) {
+            console.error('Error inserting unique IP:', err);
+          }
+          next();
+        });
+      } else {
+        // IP address already exists, skip insertion
+        next();
+      }
     });
   });
 });
 
 // API endpoint to get visit statistics
 app.get('/api/visitstats', (req, res) => {
-  db.all(`
-    SELECT
-      (SELECT COUNT(*) FROM visits WHERE timestamp > datetime('now', '-30 days')) AS visitsLast30Days,
-      (SELECT COUNT(*) FROM visits) AS totalVisits,
-      (SELECT COUNT(*) FROM unique_ips) AS uniqueVisitors
-  `, (err, rows) => {
-    if (err) {
-      console.error('Error retrieving visit stats:', err);
-      res.status(500).json({ error: 'Error retrieving visit stats' });
-      return;
-    }
-    res.json(rows[0]);
+  db.serialize(() => {
+    db.all(`
+      SELECT
+        (SELECT COUNT(*) FROM visits WHERE timestamp > datetime('now', '-30 days')) AS visitsLast30Days,
+        (SELECT COUNT(*) FROM visits) AS totalVisits
+    `, (err, rows) => {
+      if (err) {
+        console.error('Error retrieving visit stats:', err);
+        return res.status(500).json({ error: 'Error retrieving visit stats' });
+      }
+      const { visitsLast30Days, totalVisits } = rows[0];
+
+      db.get('SELECT COUNT(*) AS uniqueVisitors FROM unique_ips', (err, row) => {
+        if (err) {
+          console.error('Error retrieving unique visitors:', err);
+          return res.status(500).json({ error: 'Error retrieving unique visitors' });
+        }
+        const { uniqueVisitors } = row;
+
+        res.json({ visitsLast30Days, totalVisits, uniqueVisitors });
+      });
+    });
   });
 });
 
