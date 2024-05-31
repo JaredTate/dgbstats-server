@@ -230,35 +230,53 @@ app.get('/api/getpeers', (req, res) => {
         };
       });
 
-      // Insert or update the geo-parsed data in the database
-      const stmt = db.prepare(`INSERT OR REPLACE INTO nodes (ip, country, city, lat, lon)
-        VALUES (?, ?, ?, ?, ?)`);
-
-      geoData.forEach((node) => {
-        stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
-      });
-
-      stmt.finalize();
-
-      // Retrieve all unique nodes from the database
-      db.all('SELECT * FROM nodes', (err, rows) => {
-        if (err) {
-          console.error('Error retrieving nodes from database:', err);
-          res.status(500).json({ error: 'Error retrieving nodes from database' });
-          return;
-        }
-
-        console.log('All unique nodes:', rows);
-        uniqueNodes = rows;
-
-        // Send the updated geo data to the connected clients
-        wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
+      // Update the unique nodes in the database
+      db.serialize(() => {
+        // Clear the existing nodes table
+        db.run('DELETE FROM nodes', (err) => {
+          if (err) {
+            console.error('Error clearing nodes table:', err);
+            res.status(500).json({ error: 'Error clearing nodes table' });
+            return;
           }
-        });
 
-        res.json(output);
+          // Insert the new unique nodes into the database
+          const stmt = db.prepare(`INSERT INTO nodes (ip, country, city, lat, lon)
+            VALUES (?, ?, ?, ?, ?)`);
+
+          geoData.forEach((node) => {
+            stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
+          });
+
+          stmt.finalize((err) => {
+            if (err) {
+              console.error('Error inserting nodes into database:', err);
+              res.status(500).json({ error: 'Error inserting nodes into database' });
+              return;
+            }
+
+            // Retrieve all unique nodes from the database
+            db.all('SELECT * FROM nodes', (err, rows) => {
+              if (err) {
+                console.error('Error retrieving nodes from database:', err);
+                res.status(500).json({ error: 'Error retrieving nodes from database' });
+                return;
+              }
+
+              console.log('All unique nodes:', rows);
+              uniqueNodes = rows;
+
+              // Send the updated geo data to the connected clients
+              wss.clients.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                  client.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
+                }
+              });
+
+              res.json(output);
+            });
+          });
+        });
       });
     } catch (parseError) {
       console.error(`Error parsing Python script output: ${parseError.message}`);
@@ -266,7 +284,6 @@ app.get('/api/getpeers', (req, res) => {
     }
   });
 });
-
 const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
 
 const startFetchingData = () => {
