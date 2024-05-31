@@ -1,10 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
-const dns = require('dns');
 const geoip = require('geoip-lite');
 const NodeCache = require('node-cache');
 const sqlite3 = require('sqlite3').verbose();
+const { exec } = require('child_process');
+const path = require('path');
+const axios = require('axios');
 const { router: rpcRoutes, sendRpcRequest, getAlgoName, getBlocksByTimeRange } = require('./rpc');
 
 const app = express();
@@ -196,66 +198,85 @@ app.post('/api/blocknotify', async (req, res) => {
     res.sendStatus(500);
   }
 });
-const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
 
-const fetchSeedNodes = async () => {
-  try {
-    const addresses = await new Promise((resolve, reject) => {
-      dns.resolve4('seed.digibyte.io', (err, addresses) => {
+app.get('/api/getpeers', (req, res) => {
+  const pythonScriptPath = path.join(__dirname, 'parse_peers.dat.py');
+  const peersDatPath = '/Users/jt/Library/Application Support/DigiByte/peers.dat';
+
+  exec(`python3 ${pythonScriptPath} ${peersDatPath}`, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`Error executing Python script: ${error.message}`);
+      res.status(500).json({ error: 'Error executing Python script' });
+      return;
+    }
+    if (stderr) {
+      console.error(`Python script stderr: ${stderr}`);
+    }
+
+    try {
+      const output = JSON.parse(stdout);
+      const uniqueIPv4Addresses = output.uniqueIPv4Addresses;
+      const uniqueIPv6Addresses = output.uniqueIPv6Addresses;
+
+      // Geo-parse the IP addresses
+      const geoData = [...uniqueIPv4Addresses, ...uniqueIPv6Addresses].map((ip) => {
+        const geo = geoip.lookup(ip);
+        return {
+          ip,
+          country: geo?.country || 'Unknown',
+          city: geo?.city || 'Unknown',
+          lat: geo?.ll[0] || 0,
+          lon: geo?.ll[1] || 0,
+        };
+      });
+
+      // Insert or update the geo-parsed data in the database
+      const stmt = db.prepare(`INSERT OR REPLACE INTO nodes (ip, country, city, lat, lon)
+        VALUES (?, ?, ?, ?, ?)`);
+
+      geoData.forEach((node) => {
+        stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
+      });
+
+      stmt.finalize();
+
+      // Retrieve all unique nodes from the database
+      db.all('SELECT * FROM nodes', (err, rows) => {
         if (err) {
-          reject(err);
-        } else {
-          resolve(addresses);
+          console.error('Error retrieving nodes from database:', err);
+          res.status(500).json({ error: 'Error retrieving nodes from database' });
+          return;
         }
+
+        console.log('All unique nodes:', rows);
+        uniqueNodes = rows;
+
+        // Send the updated geo data to the connected clients
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
+          }
+        });
+
+        res.json(output);
       });
-    });
+    } catch (parseError) {
+      console.error(`Error parsing Python script output: ${parseError.message}`);
+      res.status(500).json({ error: 'Error parsing Python script output' });
+    }
+  });
+});
 
-    console.log('Fetched addresses:', addresses);
-
-    // Insert or update the fetched IPs in the database
-    const stmt = db.prepare(`INSERT OR REPLACE INTO nodes (ip, country, city, lat, lon, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?)`);
-
-    addresses.forEach((ip) => {
-      const geo = geoip.lookup(ip);
-      stmt.run(ip, geo?.country || 'Unknown', geo?.city || 'Unknown', geo?.ll[0] || 0, geo?.ll[1] || 0, Date.now());
-    });
-
-    stmt.finalize();
-
-    // Retrieve all unique nodes from the database
-    db.all('SELECT * FROM nodes', (err, rows) => {
-      if (err) {
-        console.error('Error retrieving nodes from database:', err);
-        return;
-      }
-
-      console.log('All unique nodes:', rows);
-      uniqueNodes = rows;
-
-      // Check if the number of unique nodes has increased
-      if (uniqueNodes.length > lastUniqueNodesCount) {
-        console.log(`Unique nodes count increased from ${lastUniqueNodesCount} to ${uniqueNodes.length}`);
-        lastUniqueNodesCount = uniqueNodes.length;
-      } else {
-        console.log(`Unique nodes count remains at ${uniqueNodes.length}`);
-      }
-
-      // Send the updated geo data to the connected clients
-      wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
-        }
-      });
-    });
-  } catch (error) {
-    console.error('Error fetching seed nodes:', error);
-  }
-};
+const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
 
 const startFetchingData = () => {
   setInterval(async () => {
-    await fetchSeedNodes();
+    try {
+      const response = await axios.get(`http://localhost:${port}/api/getpeers`);
+      console.log('Fetched peers data:', response.data);
+    } catch (error) {
+      console.error('Error fetching peers data:', error);
+    }
   }, fetchInterval);
 };
 
