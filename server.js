@@ -200,8 +200,8 @@ app.post('/api/blocknotify', async (req, res) => {
 });
 
 app.get('/api/getpeers', (req, res) => {
-  const pythonScriptPath = path.join(__dirname, 'parse_peers.dat.py');
-  const peersDatPath = '/Users/jt/Library/Application Support/DigiByte/peers.dat';
+  const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
+  const peersDatPath = '/home/digihash/.digibyte-scrypt/peers.dat';
 
   exec(`python3 ${pythonScriptPath} ${peersDatPath}`, (error, stdout, stderr) => {
     if (error) {

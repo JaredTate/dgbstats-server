@@ -7,7 +7,7 @@ import json
 def parse_peers_dat(filepath):
     with open(filepath, 'rb') as file:
         data = file.read()
-        print("File read successfully. Data length:", len(data))
+        # print("File read successfully. Data length:", len(data))
 
         # Parse header
         message_bytes = data[:4]
@@ -68,7 +68,7 @@ class IPAddress:
         return self.ip
 
 # Specify the path to the peers.dat file
-peers_dat_path = '/Users/jt/Library/Application Support/DigiByte/peers.dat'
+peers_dat_path = '/home/digihash/.digibyte-scrypt/peers.dat'
 
 # Parse the peers.dat file
 unique_ipv4_addresses, unique_ipv6_addresses = parse_peers_dat(peers_dat_path)

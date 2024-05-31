@@ -24,3 +24,4 @@ yarn-error.log*
 package-lock.json
 nodes.db
 package-lock.json
+nodes.db-journal
