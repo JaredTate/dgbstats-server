@@ -324,7 +324,7 @@ app.get('/api/visitstats', (req, res) => {
     SELECT
       (SELECT COUNT(*) FROM visits WHERE timestamp > datetime('now', '-30 days')) AS visitsLast30Days,
       (SELECT COUNT(*) FROM visits) AS totalVisits,
-      (SELECT COUNT(DISTINCT ip) FROM visits) AS uniqueVisitors
+      (SELECT COUNT(*) FROM (SELECT DISTINCT ip FROM visits)) AS uniqueVisitors
   `, (err, rows) => {
     if (err) {
       console.error('Error retrieving visit stats:', err);
