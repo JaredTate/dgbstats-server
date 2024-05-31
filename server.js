@@ -35,6 +35,13 @@ db.run(`CREATE TABLE IF NOT EXISTS nodes (
   lon REAL
 )`);
 
+// Create a table to store visit logs if it doesn't exist
+db.run(`CREATE TABLE IF NOT EXISTS visits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT,
+  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
+
 let uniqueNodes = [];
 let lastUniqueNodesCount = 0;
 
@@ -201,7 +208,7 @@ app.post('/api/blocknotify', async (req, res) => {
 
 app.get('/api/getpeers', (req, res) => {
   const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
-  const peersDatPath = '/home/digihash/.digibyte-scrypt/peers.dat';
+  const peersDatPath = '/Users/jt/Library/Application Support/DigiByte/peers.dat';
 
   exec(`python3 ${pythonScriptPath} ${peersDatPath}`, (error, stdout, stderr) => {
     if (error) {
@@ -284,6 +291,7 @@ app.get('/api/getpeers', (req, res) => {
     }
   });
 });
+
 const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
 
 const startFetchingData = () => {
@@ -298,6 +306,34 @@ const startFetchingData = () => {
 };
 
 startFetchingData();
+
+// Middleware to log visits
+app.use((req, res, next) => {
+  const ip = req.ip;
+  db.run('INSERT INTO visits (ip) VALUES (?)', [ip], (err) => {
+    if (err) {
+      console.error('Error inserting visit log:', err);
+    }
+    next();
+  });
+});
+
+// API endpoint to get visit statistics
+app.get('/api/visitstats', (req, res) => {
+  db.all(`
+    SELECT
+      (SELECT COUNT(*) FROM visits WHERE timestamp > datetime('now', '-30 days')) AS visitsLast30Days,
+      (SELECT COUNT(*) FROM visits) AS totalVisits,
+      (SELECT COUNT(DISTINCT ip) FROM visits) AS uniqueVisitors
+  `, (err, rows) => {
+    if (err) {
+      console.error('Error retrieving visit stats:', err);
+      res.status(500).json({ error: 'Error retrieving visit stats' });
+      return;
+    }
+    res.json(rows[0]);
+  });
+});
 
 app.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}`);
