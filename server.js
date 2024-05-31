@@ -42,6 +42,11 @@ db.run(`CREATE TABLE IF NOT EXISTS visits (
   timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 )`);
 
+// Create a table to store unique IP addresses if it doesn't exist
+db.run(`CREATE TABLE IF NOT EXISTS unique_ips (
+  ip TEXT PRIMARY KEY
+)`);
+
 let uniqueNodes = [];
 let lastUniqueNodesCount = 0;
 
@@ -314,7 +319,13 @@ app.use((req, res, next) => {
     if (err) {
       console.error('Error inserting visit log:', err);
     }
-    next();
+    // Check if the IP address is unique and insert it into the unique_ips table
+    db.run('INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)', [ip], (err) => {
+      if (err) {
+        console.error('Error inserting unique IP:', err);
+      }
+      next();
+    });
   });
 });
 
@@ -324,7 +335,7 @@ app.get('/api/visitstats', (req, res) => {
     SELECT
       (SELECT COUNT(*) FROM visits WHERE timestamp > datetime('now', '-30 days')) AS visitsLast30Days,
       (SELECT COUNT(*) FROM visits) AS totalVisits,
-      (SELECT COUNT(*) FROM (SELECT DISTINCT ip FROM visits)) AS uniqueVisitors
+      (SELECT COUNT(*) FROM unique_ips) AS uniqueVisitors
   `, (err, rows) => {
     if (err) {
       console.error('Error retrieving visit stats:', err);
