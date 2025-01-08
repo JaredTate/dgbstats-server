@@ -117,6 +117,10 @@ const fetchInitialData = async () => {
     const blockRewardResponse = await sendRpcRequest('getblockreward');
     const blockReward = parseFloat(blockRewardResponse.blockreward);
 
+    // Extract Taproot status from blockchainInfo
+    const taprootStatus = blockchainInfo.softforks.taproot;
+    console.log('Taproot status:', taprootStatus);
+
     const initialData = {
       blockchainInfo,
       chainTxStats,

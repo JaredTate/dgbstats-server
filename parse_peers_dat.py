@@ -68,7 +68,8 @@ class IPAddress:
         return self.ip
 
 # Specify the path to the peers.dat file
-peers_dat_path = '/home/digihash/.digibyte-scrypt/peers.dat'
+# peers_dat_path = '/home/digihash/.digibyte-scrypt/peers.dat'
+peers_dat_path = '/Users/jt/Library/Application Support/DigiByte/peers.dat'
 
 # Parse the peers.dat file
 unique_ipv4_addresses, unique_ipv6_addresses = parse_peers_dat(peers_dat_path)
