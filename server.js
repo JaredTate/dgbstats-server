@@ -4,10 +4,11 @@ const WebSocket = require('ws');
 const geoip = require('geoip-lite');
 const NodeCache = require('node-cache');
 const sqlite3 = require('sqlite3').verbose();
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const path = require('path');
 const axios = require('axios');
 const { router: rpcRoutes, sendRpcRequest, getAlgoName, getBlocksByTimeRange } = require('./rpc');
+const config = require('./config.js');
 
 const app = express();
 const port = process.env.PORT || 5001;
@@ -217,9 +218,8 @@ app.post('/api/blocknotify', async (req, res) => {
 
 app.get('/api/getpeers', (req, res) => {
   const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
-  const peersDatPath = '/Users/jt/Library/Application Support/DigiByte/peers.dat';
-
-  exec(`python3 ${pythonScriptPath} ${peersDatPath}`, (error, stdout, stderr) => {
+  
+  exec(`python3 ${pythonScriptPath}`, (error, stdout, stderr) => {
     if (error) {
       console.error(`Error executing Python script: ${error.message}`);
       res.status(500).json({ error: 'Error executing Python script' });
@@ -315,6 +315,15 @@ const startFetchingData = () => {
 };
 
 startFetchingData();
+
+function runPeerScript() {
+  const env = process.env.NODE_ENV || 'development';
+  const pythonProcess = spawn('python3', ['parse_peers_dat.py'], {
+    env: { ...process.env, NODE_ENV: env }
+  });
+
+  // ...existing code...
+}
 
 // Middleware to log visits
 app.use((req, res, next) => {

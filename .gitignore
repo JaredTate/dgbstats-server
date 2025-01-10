@@ -25,3 +25,6 @@ package-lock.json
 nodes.db
 package-lock.json
 nodes.db-journal
+
+# config
+config.js

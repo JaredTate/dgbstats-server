@@ -3,6 +3,7 @@ import socket
 import struct
 import hashlib
 import json
+import subprocess
 
 def parse_peers_dat(filepath):
     with open(filepath, 'rb') as file:
@@ -67,9 +68,16 @@ class IPAddress:
     def __repr__(self):
         return self.ip
 
-# Specify the path to the peers.dat file
-# peers_dat_path = '/home/digihash/.digibyte-scrypt/peers.dat'
-peers_dat_path = '/Users/jt/Library/Application Support/DigiByte/peers.dat'
+# Load configuration by executing node command
+def get_config():
+    result = subprocess.run(['node', '-e', 
+        'const config = require("./config.js"); console.log(JSON.stringify(config.paths[config.environment]))'], 
+        capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+# Get peers.dat path from config
+config = get_config()
+peers_dat_path = config['peersDataPath']
 
 # Parse the peers.dat file
 unique_ipv4_addresses, unique_ipv6_addresses = parse_peers_dat(peers_dat_path)
