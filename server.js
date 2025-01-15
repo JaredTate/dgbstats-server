@@ -1,3 +1,7 @@
+/**************************************************************
+ * COMBINED AND CORRECTED server.js
+ **************************************************************/
+
 const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
@@ -6,28 +10,46 @@ const NodeCache = require('node-cache');
 const sqlite3 = require('sqlite3').verbose();
 const { exec, spawn } = require('child_process');
 const path = require('path');
-const axios = require('axios');
-const { router: rpcRoutes, sendRpcRequest, getAlgoName, getBlocksByTimeRange } = require('./rpc');
+const axios = require('axios');  // Fix incomplete import
+
+// ------------------------- RPC IMPORTS -------------------------
+const {
+  router: rpcRoutes,
+  sendRpcRequest,
+  getAlgoName,
+  getBlocksByTimeRange
+} = require('./rpc');
+
 const config = require('./config.js');
 
+// ------------------------- EXPRESS SETUP -------------------------
 const app = express();
 const port = process.env.PORT || 5001;
 
 app.use(cors());
 app.use(express.json());
+
+// Attach RPC routes under /api
 app.use('/api', rpcRoutes);
 
+// ------------------------- WEBSOCKET SETUP -------------------------
 const wss = new WebSocket.Server({ port: 5002 });
+
+// Keep the last 240 blocks in memory
 const recentBlocks = [];
 const maxRecentBlocks = 240;
-const pingInterval = 30000; // Send a ping every 30 seconds
 
-const cache = new NodeCache({ stdTTL: 60 }); // Cache data for 1 minute
+// Send a ping every 30 seconds to keep WS alive
+const pingInterval = 30000;
 
-// Create a SQLite database connection
+// ------------------------- CACHE SETUP -------------------------
+// Cache chain info / stats for 60 seconds
+const cache = new NodeCache({ stdTTL: 60 });
+
+// ------------------------- SQLITE SETUP -------------------------
 const db = new sqlite3.Database('nodes.db');
 
-// Create a table to store unique IPs if it doesn't exist
+// Create or ensure needed tables exist
 db.run(`CREATE TABLE IF NOT EXISTS nodes (
   ip TEXT PRIMARY KEY,
   country TEXT,
@@ -36,44 +58,39 @@ db.run(`CREATE TABLE IF NOT EXISTS nodes (
   lon REAL
 )`);
 
-// Create a table to store visit logs if it doesn't exist
 db.run(`CREATE TABLE IF NOT EXISTS visits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ip TEXT,
   timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 )`);
 
-// Create a table to store unique IP addresses if it doesn't exist
 db.run(`CREATE TABLE IF NOT EXISTS unique_ips (
   ip TEXT PRIMARY KEY
 )`);
 
 let uniqueNodes = [];
-let lastUniqueNodesCount = 0;
-
 let connectedClients = 0;
 
+// ------------------------- WEBSOCKET CONNECTION -------------------------
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
   connectedClients++;
   console.log(`Number of connected clients: ${connectedClients}`);
 
-  // Send the cached recent blocks to the new client
-  console.log('Sending recent blocks to client:', recentBlocks);
+  // Send the recent blocks to the new client
+  console.log('Sending recent blocks to new client:', recentBlocks.length);
   ws.send(JSON.stringify({ type: 'recentBlocks', data: recentBlocks }));
 
-  // Send the cached initial data to the new client
+  // Send initial cached chain data (if any)
   const initialData = cache.get('initialData');
   if (initialData) {
-    console.log('Sending initial data to client:', initialData);
     ws.send(JSON.stringify({ type: 'initialData', data: initialData }));
   }
 
-  // Send all unique nodes to the new client
-  console.log('Sending all unique nodes to client:', uniqueNodes);
+  // Send geo data to the new client
   ws.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
 
-  // Send ping messages to keep the connection alive
+  // Keep WS alive by sending pings
   const pingTimer = setInterval(() => {
     ws.ping();
   }, pingInterval);
@@ -81,36 +98,167 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     console.log('WebSocket client disconnected');
     connectedClients--;
-    console.log(`Number of connected clients: ${connectedClients}`);
     clearInterval(pingTimer);
   });
 });
 
-// Function to fetch the latest blocks from the server and store them in the recentBlocks array
+// ------------------------- DECODE COINBASE UTILITY -------------------------
+function decodeCoinbaseData(coinbaseHex) {
+  try {
+    const buffer = Buffer.from(coinbaseHex, 'hex');
+    const text = buffer.toString('utf8');
+
+    // Some common patterns for pool identifiers
+    const poolPatterns = [
+      /\/(.*?)\//,             // /PoolName/
+      /\[(.*?)\]/,             // [PoolName]
+      /@(.*?)@/,               // @PoolName@
+      /pool\.(.*?)\.com/,      // pool.Name.com
+      /(.*?)pool/i,            // Somethingpool
+      /^(?:[\x00-\xFF]*?)([\x20-\x7F]{3,})/ // fallback: readable ASCII
+    ];
+
+    let poolIdentifier = 'Unknown';
+    for (const pattern of poolPatterns) {
+      const match = text.match(pattern);
+      if (match && match[1] && match[1].length >= 3) {
+        poolIdentifier = match[1].trim();
+        break;
+      }
+    }
+
+    return { poolIdentifier, rawText: text };
+  } catch (error) {
+    console.error('Error decoding coinbase:', error);
+    return { poolIdentifier: 'Unknown', rawText: '' };
+  }
+}
+
+// ------------------------- FETCH LATEST BLOCKS ON STARTUP -------------------------
 async function fetchLatestBlocks() {
   try {
-    const latestBlocks = await sendRpcRequest('getblockchaininfo');
-    const latestBlockHeight = latestBlocks.blocks;
-
+    // 1) Get chain tip (number of blocks)
+    const blockchainInfo = await sendRpcRequest('getblockchaininfo');
+    const latestBlockHeight = blockchainInfo.blocks;
     console.log('Latest block height:', latestBlockHeight);
 
-    // Fetch the most recent blocks
+    // 2) Get blocks from the last hour
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
-    const blocks = await getBlocksByTimeRange(oneHourAgo, latestBlockHeight);
+    const blocksBasic = await getBlocksByTimeRange(oneHourAgo, latestBlockHeight);
 
-    recentBlocks.push(...blocks);
+    // 3) For each block, fetch full data (verbosity=2), decode coinbase
+    const fetchedFullBlocks = [];
+    for (const b of blocksBasic) {
+      const fullBlock = await sendRpcRequest('getblock', [b.hash, 2]);
+      if (!fullBlock || !fullBlock.tx?.[0]) {
+        continue; // skip if no coinbase transaction
+      }
+
+      const coinbaseTx = fullBlock.tx[0];
+      const coinbaseOutputs = coinbaseTx.vout || [];
+      const firstOutputWithAddress = coinbaseOutputs.find(
+        (out) => out?.scriptPubKey?.address
+      );
+      const minerAddress = firstOutputWithAddress
+        ? firstOutputWithAddress.scriptPubKey.address
+        : '';
+
+      const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
+      const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
+
+      fetchedFullBlocks.push({
+        height: fullBlock.height,
+        hash: fullBlock.hash,
+        algo: getAlgoName(fullBlock.pow_algo),
+        txCount: fullBlock.nTx,
+        difficulty: fullBlock.difficulty,
+        timestamp: fullBlock.time,
+        minedTo: minerAddress,
+        minerAddress,
+        poolIdentifier,
+        taprootSignaling,
+        version: fullBlock.version
+      });
+    }
+
+    // 4) Sort descending by height, keep up to 240
+    recentBlocks.push(...fetchedFullBlocks);
     recentBlocks.sort((a, b) => b.height - a.height);
     recentBlocks.splice(maxRecentBlocks);
 
-    console.log('Fetched recent blocks:', recentBlocks);
+    console.log(`Loaded ${recentBlocks.length} preloaded blocks.`);
   } catch (error) {
     console.error('Error fetching latest blocks:', error);
   }
 }
-// Fetch the latest blocks when the server starts
-fetchLatestBlocks();
 
-const fetchInitialData = async () => {
+// ------------------------- BLOCK NOTIFY (NEW BLOCK) -------------------------
+app.post('/api/blocknotify', async (req, res) => {
+  try {
+    if (!req.body?.blockhash) {
+      throw new Error('blockhash is missing in request body');
+    }
+
+    const blockHash = req.body.blockhash;
+    console.log('Blocknotify triggered for hash:', blockHash);
+
+    // 1) Get full block data
+    const fullBlock = await sendRpcRequest('getblock', [blockHash, 2]);
+    if (!fullBlock || !fullBlock.tx?.[0]) {
+      console.log('No coinbase TX found for this block, skipping.');
+      return res.sendStatus(200);
+    }
+
+    const coinbaseTx = fullBlock.tx[0];
+    const coinbaseOutputs = coinbaseTx.vout || [];
+    const firstOutputWithAddress = coinbaseOutputs.find(
+      (out) => out?.scriptPubKey?.address
+    );
+
+    const minerAddress = firstOutputWithAddress
+      ? firstOutputWithAddress.scriptPubKey.address
+      : '';
+
+    const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
+    const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
+
+    // 2) Build the new block object
+    const newBlock = {
+      height: fullBlock.height,
+      hash: fullBlock.hash,
+      algo: getAlgoName(fullBlock.pow_algo),
+      txCount: fullBlock.nTx,
+      difficulty: fullBlock.difficulty,
+      timestamp: fullBlock.time,
+      minedTo: minerAddress,
+      minerAddress,
+      poolIdentifier,
+      taprootSignaling,
+      version: fullBlock.version
+    };
+
+    // 3) Insert new block at front, prune
+    recentBlocks.unshift(newBlock);
+    recentBlocks.sort((a, b) => b.height - a.height);
+    recentBlocks.splice(maxRecentBlocks);
+
+    // 4) Broadcast via WebSocket
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        console.log(`Sending newBlock to client: ${newBlock.height}`);
+        client.send(JSON.stringify({ type: 'newBlock', data: newBlock }));
+      }
+    });
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('Block notification error:', error);
+    res.sendStatus(500);
+  }
+});
+
+// ------------------------- INITIAL DATA FETCH -------------------------
+async function fetchInitialData() {
   try {
     const blockchainInfo = await sendRpcRequest('getblockchaininfo');
     const chainTxStats = await sendRpcRequest('getchaintxstats');
@@ -118,20 +266,17 @@ const fetchInitialData = async () => {
     const blockRewardResponse = await sendRpcRequest('getblockreward');
     const blockReward = parseFloat(blockRewardResponse.blockreward);
 
-    // Extract Taproot status from blockchainInfo
-    const taprootStatus = blockchainInfo.softforks.taproot;
-    console.log('Taproot status:', taprootStatus);
-
     const initialData = {
       blockchainInfo,
       chainTxStats,
       txOutsetInfo,
-      blockReward,
+      blockReward
     };
 
+    // Cache this data, so new clients get it instantly
     cache.set('initialData', initialData);
 
-    // Send the updated initial data to all connected clients
+    // Broadcast to all existing clients
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'initialData', data: initialData }));
@@ -140,82 +285,11 @@ const fetchInitialData = async () => {
   } catch (error) {
     console.error('Error fetching initial data:', error);
   }
-};
+}
 
-// Fetch initial data when the server starts
-fetchInitialData();
-
-// Fetch initial data every 30 Seconds
-setInterval(fetchInitialData, 30000);
-
-// server.js
-app.post('/api/blocknotify', async (req, res) => {
-  try {
-    if (!req.body) {
-      throw new Error('Request body is missing');
-    }
-
-    const blockHash = req.body.blockhash;
-    console.log('Received block notification for:', blockHash);
-
-    const block = await sendRpcRequest('getblock', [blockHash, 2]);
-    if (!block) {
-      console.error(`Failed to fetch block data for block hash: ${blockHash}`);
-      res.sendStatus(200);
-      return;
-    }
-
-    let minedTo = '';
-    let poolIdentifier = 'Unknown';
-
-    if (block.tx && block.tx.length > 0) {
-      const coinbaseTx = block.tx[0];
-      if (coinbaseTx.vout && coinbaseTx.vout.length > 1 && coinbaseTx.vout[1].scriptPubKey && coinbaseTx.vout[1].scriptPubKey.address) {
-        minedTo = coinbaseTx.vout[1].scriptPubKey.address;
-      }
-
-      // Extract pool identifier from coinbase transaction
-      const coinbaseHex = coinbaseTx.vin[0].coinbase;
-      const decodedCoinbase = Buffer.from(coinbaseHex, 'hex').toString('ascii');
-      const poolIdentifierRegex = /\/(.*)\//;
-      const match = decodedCoinbase.match(poolIdentifierRegex);
-      if (match && match[1]) {
-        poolIdentifier = match[1];
-      }
-    }
-
-    const newBlock = {
-      height: block.height,
-      hash: block.hash,
-      algo: getAlgoName(block.pow_algo),
-      txCount: block.nTx,
-      difficulty: block.difficulty,
-      timestamp: block.time,
-      minedTo,
-      poolIdentifier,
-    };
-
-    console.log('New block data:', newBlock);
-
-    // Store the new block in the recentBlocks array
-    recentBlocks.unshift(newBlock);
-    recentBlocks.splice(maxRecentBlocks);
-
-    // Notify connected WebSocket clients
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        console.log('Sending new block to client:', newBlock);
-        client.send(JSON.stringify({ type: 'newBlock', data: newBlock }));
-      }
-    });
-
-    res.sendStatus(200);
-  } catch (error) {
-    console.error('Error processing block notification:', error);
-    res.sendStatus(500);
-  }
-});
-
+/* ------------------------------------------------------------------
+ * GETPEERS + GEO STUFF
+ * ------------------------------------------------------------------ */
 app.get('/api/getpeers', (req, res) => {
   const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
   
@@ -325,21 +399,21 @@ function runPeerScript() {
   // ...existing code...
 }
 
-// Middleware to log visits
+// ------------------------- VISIT LOGGING MIDDLEWARE -------------------------
 app.use((req, res, next) => {
   const ip = req.ip;
   db.run('INSERT INTO visits (ip) VALUES (?)', [ip], (err) => {
     if (err) {
       console.error('Error inserting visit log:', err);
     }
-    // Check if the IP address is already in the unique_ips table
+    // Check if IP is already in unique_ips
     db.get('SELECT COUNT(*) AS count FROM unique_ips WHERE ip = ?', [ip], (err, row) => {
       if (err) {
         console.error('Error checking unique IP:', err);
         return next();
       }
       if (row.count === 0) {
-        // IP address is unique, insert it into the unique_ips table
+        // Insert into unique_ips
         db.run('INSERT INTO unique_ips (ip) VALUES (?)', [ip], (err) => {
           if (err) {
             console.error('Error inserting unique IP:', err);
@@ -347,14 +421,13 @@ app.use((req, res, next) => {
           next();
         });
       } else {
-        // IP address already exists, skip insertion
         next();
       }
     });
   });
 });
 
-// API endpoint to get visit statistics
+// ------------------------- VISIT STATISTICS -------------------------
 app.get('/api/visitstats', (req, res) => {
   db.serialize(() => {
     db.all(`
@@ -375,12 +448,76 @@ app.get('/api/visitstats', (req, res) => {
         }
         const { uniqueVisitors } = row;
 
-        res.json({ visitsLast30Days, totalVisits, uniqueVisitors });
+        res.json({
+          visitsLast30Days,
+          totalVisits,
+          uniqueVisitors
+        });
       });
     });
   });
 });
 
-app.listen(port, () => {
-  console.log(`Server listening at http://localhost:${port}`);
+// ------------------------- STARTUP LOGIC -------------------------
+async function fetchPeersWithRetry() {
+  const maxRetries = 3;
+  const retryDelay = 5000; // 5 seconds
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // First check if server is ready
+      const healthCheck = await axios.get(`http://localhost:${port}/health`).catch(() => null);
+      if (!healthCheck) {
+        console.log(`Server not ready, attempt ${attempt}/${maxRetries}`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        continue;
+      }
+
+      const response = await axios.get(`http://localhost:${port}/api/getpeers`);
+      console.log('Successfully fetched peers data');
+      return response.data;
+    } catch (error) {
+      console.log(`Peer fetch attempt ${attempt}/${maxRetries} failed`);
+      if (attempt === maxRetries) {
+        console.error('Max retries reached for peer fetch');
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  }
+}
+
+// Add health check endpoint
+app.get('/health', (req, res) => {
+  res.sendStatus(200);
 });
+
+// Update the startup sequence
+async function startServer() {
+  try {
+    // First start the HTTP server
+    await new Promise((resolve, reject) => {
+      const server = app.listen(port, () => {
+        console.log(`Server listening at http://localhost:${port}`);
+        resolve();
+      }).on('error', reject);
+    });
+
+    // Then initialize data
+    await Promise.all([
+      fetchInitialData(),
+      fetchLatestBlocks()
+    ]);
+
+    // Start the periodic updates after server is running
+    setInterval(fetchInitialData, 30000);
+    setInterval(fetchPeersWithRetry, fetchInterval);
+
+  } catch (error) {
+    console.error('Error during startup:', error);
+    process.exit(1);
+  }
+}
+
+// Start the server
+startServer();
