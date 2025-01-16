@@ -1,5 +1,6 @@
 /**************************************************************
- * COMBINED AND CORRECTED server.js
+ * COMBINED AND CORRECTED server.js WITH IN-MEMORY STORAGE
+ * + 1 MINUTE INTERVALS
  **************************************************************/
 
 const express = require('express');
@@ -10,7 +11,7 @@ const NodeCache = require('node-cache');
 const sqlite3 = require('sqlite3').verbose();
 const { exec, spawn } = require('child_process');
 const path = require('path');
-const axios = require('axios');  // Fix incomplete import
+const axios = require('axios');
 
 // ------------------------- RPC IMPORTS -------------------------
 const {
@@ -43,8 +44,12 @@ const maxRecentBlocks = 240;
 const pingInterval = 30000;
 
 // ------------------------- CACHE SETUP -------------------------
-// Cache chain info / stats for 60 seconds
+// We still use NodeCache, but only as a fallback. TTL = 60 seconds.
 const cache = new NodeCache({ stdTTL: 60 });
+
+// ------------------------- IN-MEMORY INITIAL DATA -------------------------
+// This ensures we never lose data if the cache TTL expires or an RPC call fails.
+let inMemoryInitialData = null;
 
 // ------------------------- SQLITE SETUP -------------------------
 const db = new sqlite3.Database('nodes.db');
@@ -77,17 +82,22 @@ wss.on('connection', (ws) => {
   connectedClients++;
   console.log(`Number of connected clients: ${connectedClients}`);
 
-  // Send the recent blocks to the new client
+  // 1) Send recent blocks
   console.log('Sending recent blocks to new client:', recentBlocks.length);
   ws.send(JSON.stringify({ type: 'recentBlocks', data: recentBlocks }));
 
-  // Send initial cached chain data (if any)
-  const initialData = cache.get('initialData');
-  if (initialData) {
-    ws.send(JSON.stringify({ type: 'initialData', data: initialData }));
+  // 2) Send initialData from memory (if we have it)
+  if (inMemoryInitialData) {
+    ws.send(JSON.stringify({ type: 'initialData', data: inMemoryInitialData }));
+  } else {
+    // If we prefer, we can also check NodeCache as fallback:
+    const cached = cache.get('initialData');
+    if (cached) {
+      ws.send(JSON.stringify({ type: 'initialData', data: cached }));
+    }
   }
 
-  // Send geo data to the new client
+  // 3) Send geo data (unique nodes)
   ws.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
 
   // Keep WS alive by sending pings
@@ -137,26 +147,23 @@ function decodeCoinbaseData(coinbaseHex) {
 // ------------------------- FETCH LATEST BLOCKS ON STARTUP -------------------------
 async function fetchLatestBlocks() {
   try {
-    // 1) Get chain tip (number of blocks)
+    // 1) Get chain tip
     const blockchainInfo = await sendRpcRequest('getblockchaininfo');
     const latestBlockHeight = blockchainInfo.blocks;
     console.log('Latest block height:', latestBlockHeight);
 
-    // 2) Get blocks from the last hour
+    // 2) Get blocks from last hour
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
     const blocksBasic = await getBlocksByTimeRange(oneHourAgo, latestBlockHeight);
 
-    // 3) For each block, fetch full data (verbosity=2), decode coinbase
+    // 3) For each block, fetch full data
     const fetchedFullBlocks = [];
     for (const b of blocksBasic) {
       const fullBlock = await sendRpcRequest('getblock', [b.hash, 2]);
-      if (!fullBlock || !fullBlock.tx?.[0]) {
-        continue; // skip if no coinbase transaction
-      }
+      if (!fullBlock || !fullBlock.tx?.[0]) continue;
 
       const coinbaseTx = fullBlock.tx[0];
-      const coinbaseOutputs = coinbaseTx.vout || [];
-      const firstOutputWithAddress = coinbaseOutputs.find(
+      const firstOutputWithAddress = coinbaseTx.vout?.find(
         (out) => out?.scriptPubKey?.address
       );
       const minerAddress = firstOutputWithAddress
@@ -202,19 +209,17 @@ app.post('/api/blocknotify', async (req, res) => {
     const blockHash = req.body.blockhash;
     console.log('Blocknotify triggered for hash:', blockHash);
 
-    // 1) Get full block data
+    // 1) Fetch full block
     const fullBlock = await sendRpcRequest('getblock', [blockHash, 2]);
     if (!fullBlock || !fullBlock.tx?.[0]) {
-      console.log('No coinbase TX found for this block, skipping.');
+      console.log('No coinbase TX found, skipping.');
       return res.sendStatus(200);
     }
 
     const coinbaseTx = fullBlock.tx[0];
-    const coinbaseOutputs = coinbaseTx.vout || [];
-    const firstOutputWithAddress = coinbaseOutputs.find(
+    const firstOutputWithAddress = coinbaseTx.vout?.find(
       (out) => out?.scriptPubKey?.address
     );
-
     const minerAddress = firstOutputWithAddress
       ? firstOutputWithAddress.scriptPubKey.address
       : '';
@@ -222,7 +227,7 @@ app.post('/api/blocknotify', async (req, res) => {
     const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
     const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
 
-    // 2) Build the new block object
+    // 2) Build the new block
     const newBlock = {
       height: fullBlock.height,
       hash: fullBlock.hash,
@@ -237,7 +242,7 @@ app.post('/api/blocknotify', async (req, res) => {
       version: fullBlock.version
     };
 
-    // 3) Insert new block at front, prune
+    // 3) Insert new block at front
     recentBlocks.unshift(newBlock);
     recentBlocks.sort((a, b) => b.height - a.height);
     recentBlocks.splice(maxRecentBlocks);
@@ -273,10 +278,13 @@ async function fetchInitialData() {
       blockReward
     };
 
-    // Cache this data, so new clients get it instantly
+    // 1) Store in NodeCache (optional)
     cache.set('initialData', initialData);
 
-    // Broadcast to all existing clients
+    // 2) Also store in memory (so we never lose it)
+    inMemoryInitialData = initialData;
+
+    // 3) Broadcast to existing clients
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'initialData', data: initialData }));
@@ -284,6 +292,9 @@ async function fetchInitialData() {
     });
   } catch (error) {
     console.error('Error fetching initial data:', error);
+
+    // NOTE: We do NOT clear inMemoryInitialData on error.
+    // So we keep showing old data to users until a successful fetch.
   }
 }
 
@@ -296,8 +307,7 @@ app.get('/api/getpeers', (req, res) => {
   exec(`python3 ${pythonScriptPath}`, (error, stdout, stderr) => {
     if (error) {
       console.error(`Error executing Python script: ${error.message}`);
-      res.status(500).json({ error: 'Error executing Python script' });
-      return;
+      return res.status(500).json({ error: 'Error executing Python script' });
     }
     if (stderr) {
       console.error(`Python script stderr: ${stderr}`);
@@ -315,48 +325,44 @@ app.get('/api/getpeers', (req, res) => {
           ip,
           country: geo?.country || 'Unknown',
           city: geo?.city || 'Unknown',
-          lat: geo?.ll[0] || 0,
-          lon: geo?.ll[1] || 0,
+          lat: geo?.ll?.[0] || 0,
+          lon: geo?.ll?.[1] || 0
         };
       });
 
-      // Update the unique nodes in the database
+      // Update DB
       db.serialize(() => {
-        // Clear the existing nodes table
-        db.run('DELETE FROM nodes', (err) => {
-          if (err) {
-            console.error('Error clearing nodes table:', err);
-            res.status(500).json({ error: 'Error clearing nodes table' });
-            return;
+        db.run('DELETE FROM nodes', (delErr) => {
+          if (delErr) {
+            console.error('Error clearing nodes table:', delErr);
+            return res.status(500).json({ error: 'Error clearing nodes table' });
           }
 
-          // Insert the new unique nodes into the database
-          const stmt = db.prepare(`INSERT INTO nodes (ip, country, city, lat, lon)
-            VALUES (?, ?, ?, ?, ?)`);
+          const stmt = db.prepare(`
+            INSERT INTO nodes (ip, country, city, lat, lon)
+            VALUES (?, ?, ?, ?, ?)
+          `);
 
           geoData.forEach((node) => {
             stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
           });
 
-          stmt.finalize((err) => {
-            if (err) {
-              console.error('Error inserting nodes into database:', err);
-              res.status(500).json({ error: 'Error inserting nodes into database' });
-              return;
+          stmt.finalize((finalizeErr) => {
+            if (finalizeErr) {
+              console.error('Error inserting nodes:', finalizeErr);
+              return res.status(500).json({ error: 'Error inserting nodes into database' });
             }
 
-            // Retrieve all unique nodes from the database
-            db.all('SELECT * FROM nodes', (err, rows) => {
-              if (err) {
-                console.error('Error retrieving nodes from database:', err);
-                res.status(500).json({ error: 'Error retrieving nodes from database' });
-                return;
+            db.all('SELECT * FROM nodes', (selectErr, rows) => {
+              if (selectErr) {
+                console.error('Error retrieving nodes from DB:', selectErr);
+                return res.status(500).json({ error: 'Error retrieving nodes from DB' });
               }
 
               console.log('All unique nodes:', rows);
               uniqueNodes = rows;
 
-              // Send the updated geo data to the connected clients
+              // Broadcast updated geo data
               wss.clients.forEach((client) => {
                 if (client.readyState === WebSocket.OPEN) {
                   client.send(JSON.stringify({ type: 'geoData', data: uniqueNodes }));
@@ -370,13 +376,15 @@ app.get('/api/getpeers', (req, res) => {
       });
     } catch (parseError) {
       console.error(`Error parsing Python script output: ${parseError.message}`);
-      res.status(500).json({ error: 'Error parsing Python script output' });
+      return res.status(500).json({ error: 'Error parsing Python script output' });
     }
   });
 });
 
-const fetchInterval = 30 * 1000; // 30 seconds in milliseconds
-
+/* ------------------------------------------------------------------
+ * Periodically fetch peers
+ * ------------------------------------------------------------------ */
+let fetchInterval = 60000; // 1 minute, per your request
 const startFetchingData = () => {
   setInterval(async () => {
     try {
@@ -387,16 +395,26 @@ const startFetchingData = () => {
     }
   }, fetchInterval);
 };
-
 startFetchingData();
 
+/* ------------------------------------------------------------------
+ * runPeerScript (optional)
+ * ------------------------------------------------------------------ */
 function runPeerScript() {
   const env = process.env.NODE_ENV || 'development';
   const pythonProcess = spawn('python3', ['parse_peers_dat.py'], {
     env: { ...process.env, NODE_ENV: env }
   });
 
-  // ...existing code...
+  pythonProcess.stdout.on('data', (data) => {
+    console.log(`parse_peers_dat.py stdout: ${data}`);
+  });
+  pythonProcess.stderr.on('data', (data) => {
+    console.error(`parse_peers_dat.py stderr: ${data}`);
+  });
+  pythonProcess.on('close', (code) => {
+    console.log(`parse_peers_dat.py script exited with code ${code}`);
+  });
 }
 
 // ------------------------- VISIT LOGGING MIDDLEWARE -------------------------
@@ -413,7 +431,6 @@ app.use((req, res, next) => {
         return next();
       }
       if (row.count === 0) {
-        // Insert into unique_ips
         db.run('INSERT INTO unique_ips (ip) VALUES (?)', [ip], (err) => {
           if (err) {
             console.error('Error inserting unique IP:', err);
@@ -458,6 +475,11 @@ app.get('/api/visitstats', (req, res) => {
   });
 });
 
+// ------------------------- HEALTH CHECK (OPTIONAL) -------------------------
+app.get('/health', (req, res) => {
+  res.sendStatus(200);
+});
+
 // ------------------------- STARTUP LOGIC -------------------------
 async function fetchPeersWithRetry() {
   const maxRetries = 3;
@@ -465,7 +487,7 @@ async function fetchPeersWithRetry() {
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // First check if server is ready
+      // Optionally check if server is ready
       const healthCheck = await axios.get(`http://localhost:${port}/health`).catch(() => null);
       if (!healthCheck) {
         console.log(`Server not ready, attempt ${attempt}/${maxRetries}`);
@@ -487,15 +509,10 @@ async function fetchPeersWithRetry() {
   }
 }
 
-// Add health check endpoint
-app.get('/health', (req, res) => {
-  res.sendStatus(200);
-});
-
-// Update the startup sequence
+// ------------------------- MAIN SERVER STARTUP -------------------------
 async function startServer() {
   try {
-    // First start the HTTP server
+    // 1) Start the server
     await new Promise((resolve, reject) => {
       const server = app.listen(port, () => {
         console.log(`Server listening at http://localhost:${port}`);
@@ -503,15 +520,16 @@ async function startServer() {
       }).on('error', reject);
     });
 
-    // Then initialize data
+    // 2) Initialize data in parallel:
     await Promise.all([
-      fetchInitialData(),
-      fetchLatestBlocks()
+      fetchInitialData(),    // stores in memory + broadcasts
+      fetchLatestBlocks()    // populates recentBlocks
     ]);
 
-    // Start the periodic updates after server is running
-    setInterval(fetchInitialData, 30000);
-    setInterval(fetchPeersWithRetry, fetchInterval);
+    // 3) Periodic updates:
+    //    If you only want new data every MINUTE, use 60000
+    setInterval(fetchInitialData, 60000);  
+    setInterval(fetchPeersWithRetry, 60000); 
 
   } catch (error) {
     console.error('Error during startup:', error);
