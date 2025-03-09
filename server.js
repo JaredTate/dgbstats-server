@@ -12,6 +12,8 @@ const sqlite3 = require('sqlite3').verbose();
 const { exec, spawn } = require('child_process');
 const path = require('path');
 const axios = require('axios');
+const fs = require('fs').promises;
+const crypto = require('crypto');
 
 // ------------------------- RPC IMPORTS -------------------------
 const {
@@ -316,11 +318,55 @@ app.post('/api/blocknotify', async (req, res) => {
 // ------------------------- INITIAL DATA FETCH -------------------------
 async function fetchInitialData() {
   try {
+    console.log('Fetching initial blockchain data...');
+    
+    // First, get the data that rarely fails
     const blockchainInfo = await sendRpcRequest('getblockchaininfo');
+    if (!blockchainInfo) {
+      throw new Error('Unable to fetch basic blockchain info');
+    }
+    
     const chainTxStats = await sendRpcRequest('getchaintxstats');
-    const txOutsetInfo = await sendRpcRequest('gettxoutsetinfo');
     const blockRewardResponse = await sendRpcRequest('getblockreward');
-    const blockReward = parseFloat(blockRewardResponse.blockreward);
+    const blockReward = parseFloat(blockRewardResponse?.blockreward || '0');
+    
+    // Try to get txoutsetinfo with a longer timeout, but continue if it fails
+    let txOutsetInfo = null;
+    try {
+      console.log('Fetching UTXO set info (may take a while)...');
+      txOutsetInfo = await sendRpcRequest('gettxoutsetinfo');
+      console.log('Successfully fetched UTXO set info');
+    } catch (txOutsetError) {
+      console.error('Failed to fetch txoutsetinfo:', txOutsetError.message);
+      
+      // Try to get a cached version if available
+      const { rpcCache } = require('./rpc');
+      const cacheKey = `rpc:gettxoutsetinfo:${crypto.createHash('md5').update(JSON.stringify([])).digest('hex')}`;
+      txOutsetInfo = rpcCache?.get(cacheKey, true); // Get even if expired
+      
+      if (txOutsetInfo) {
+        console.log('Using cached txoutsetinfo data');
+        
+        // If we have blockchain height, update the estimate
+        if (txOutsetInfo._estimated && blockchainInfo) {
+          txOutsetInfo.height = blockchainInfo.blocks;
+          console.log('Updated estimated UTXO data with current height');
+        }
+      } else {
+        console.log('No UTXO data available, creating placeholder');
+        txOutsetInfo = {
+          height: blockchainInfo.blocks,
+          bestblock: "",
+          transactions: 0,
+          txouts: 0, 
+          bogosize: 0,
+          hash_serialized_2: "",
+          disk_size: 0,
+          total_amount: 0,
+          _estimated: true
+        };
+      }
+    }
 
     const initialData = {
       blockchainInfo,
@@ -329,29 +375,31 @@ async function fetchInitialData() {
       blockReward
     };
 
-    // 1) Store in NodeCache (optional)
+    // Store in NodeCache (optional)
     cache.set('initialData', initialData);
 
-    // 2) Also store in memory (so we never lose it)
+    // Also store in memory (so we never lose it)
     inMemoryInitialData = initialData;
 
-    // 3) Broadcast to existing clients
+    // Broadcast to existing clients
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'initialData', data: initialData }));
       }
     });
+    
+    console.log('Initial data fetch complete');
+    return initialData;
   } catch (error) {
     console.error('Error fetching initial data:', error);
 
     // NOTE: We do NOT clear inMemoryInitialData on error.
     // So we keep showing old data to users until a successful fetch.
+    return inMemoryInitialData;
   }
 }
 
-/* ------------------------------------------------------------------
- * GETPEERS + GEO STUFF
- * ------------------------------------------------------------------ */
+// ------------------------- GETPEERS + GEO STUFF -------------------------
 app.get('/api/getpeers', (req, res) => {
   // First check if we have cached peer data (10 minute cache)
   const cachedPeers = peerCache.get('peerData');
@@ -359,10 +407,9 @@ app.get('/api/getpeers', (req, res) => {
     console.log('Using cached peer data (expires in', Math.floor((peerCache.getTtl('peerData') - Date.now()) / 1000), 'seconds)');
     return res.json(cachedPeers);
   }
-  
+
   console.log('No cached peer data found, fetching fresh data...');
   const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
-  
   exec(`python3 ${pythonScriptPath}`, { timeout: 30000 }, (error, stdout, stderr) => {
     if (error) {
       console.error(`Error executing Python script: ${error.message}`);
@@ -377,19 +424,17 @@ app.get('/api/getpeers', (req, res) => {
       if (!stdout || stdout.trim() === '') {
         return res.status(500).json({ error: 'Empty response from peer script' });
       }
-      
       const output = JSON.parse(stdout);
       
       // Validate output format
       if (!output.uniqueIPv4Addresses || !output.uniqueIPv6Addresses) {
         return res.status(500).json({ error: 'Invalid peer data format' });
       }
-      
+
       const uniqueIPv4Addresses = output.uniqueIPv4Addresses;
       const uniqueIPv6Addresses = output.uniqueIPv6Addresses;
-      
       console.log(`Parsed peer data: ${uniqueIPv4Addresses.length} IPv4, ${uniqueIPv6Addresses.length} IPv6 addresses`);
-
+      
       // Geo-parse the IP addresses
       const geoData = [...uniqueIPv4Addresses, ...uniqueIPv6Addresses].map((ip) => {
         const geo = geoip.lookup(ip);
@@ -401,9 +446,8 @@ app.get('/api/getpeers', (req, res) => {
           lon: geo?.ll?.[1] || 0
         };
       });
-      
       console.log(`Geo-parsed ${geoData.length} IP addresses`);
-
+      
       // Update DB
       db.serialize(() => {
         db.run('DELETE FROM nodes', (delErr) => {
@@ -540,7 +584,6 @@ app.get('/api/cachestatus', (req, res) => {
   const rpccacheInfo = {
     stats: rpcCache ? { 
       keys: rpcCache.keys().length,
-      // Don't access getCacheStats() since it might not exist
     } : null
   };
 
@@ -569,10 +612,9 @@ app.post('/api/refresh-peers', async (req, res) => {
     // Clear existing peer caches
     peerCache.del('peerData');
     peerCache.del('geoNodes');
-    
-    // Fetch fresh data    
-    const peerData = await fetchPeersWithRetry();
 
+    // Fetch fresh data
+    const peerData = await fetchPeersWithRetry();
     res.json({
       success: true,
       message: 'Peer data refreshed',
@@ -596,6 +638,58 @@ app.get('/health', (req, res) => {
   res.sendStatus(200);
 });
 
+// ------------------------- CACHE PERSISTENCE -------------------------
+// This ensures we can recover data even if the server restarts
+// Save cache data to disk for critical information
+async function saveCacheToDisk() {
+  try {
+    const dataToSave = {
+      initialData: inMemoryInitialData,
+      timestamp: Date.now()
+    };
+    
+    await fs.writeFile(
+      path.join(__dirname, 'cache-backup.json'),
+      JSON.stringify(dataToSave, null, 2),
+      'utf8'
+    );
+    
+    console.log('Cache data saved to disk successfully');
+  } catch (error) {
+    console.error('Failed to save cache to disk:', error);
+  }
+}
+
+// Load cache data from disk on startup
+async function loadCacheFromDisk() {
+  try {
+    const filePath = path.join(__dirname, 'cache-backup.json');
+    
+    // Check if the file exists
+    try {
+      await fs.access(filePath);
+    } catch (e) {
+      console.log('No cache backup file found');
+      return null;
+    }
+
+    const fileData = await fs.readFile(filePath, 'utf8');
+    const cacheData = JSON.parse(fileData);
+
+    // Check if the data is too old (older than 1 day)
+    if (Date.now() - cacheData.timestamp > 86400000) {
+      console.log('Cache backup is too old, not using it');
+      return null;
+    }
+
+    console.log('Loaded cache data from disk');
+    return cacheData;
+  } catch (error) {
+    console.error('Failed to load cache from disk:', error);
+    return null;
+  }
+}
+
 // ------------------------- STARTUP LOGIC -------------------------
 async function fetchPeersWithRetry() {
   console.log("Starting peer data fetch...");
@@ -613,7 +707,7 @@ async function fetchPeersWithRetry() {
         await new Promise(resolve => setTimeout(resolve, retryDelay));
         continue;
       }
-      
+
       // Make direct request to local endpoint
       const response = await axios.get(`http://localhost:${port}/api/getpeers`);
       
@@ -638,7 +732,7 @@ async function fetchPeersWithRetry() {
         }
         throw new Error('Failed to fetch peer data after multiple attempts');
       }
-      
+
       // Wait before retrying
       await new Promise(resolve => setTimeout(resolve, retryDelay));
     }
@@ -649,6 +743,14 @@ async function startServer() {
   try {
     console.log('Starting DigiByte Stats server...');
 
+    // 0) Try to load cache from disk before anything else
+    console.log('Checking for cached data from previous run...');
+    const diskCache = await loadCacheFromDisk();
+    if (diskCache && diskCache.initialData) {
+      console.log('Loaded initial data from disk cache');
+      inMemoryInitialData = diskCache.initialData;
+    }
+
     // 1) Start the server
     const server = app.listen(port, () => {
       console.log(`Server listening at http://localhost:${port}`);
@@ -657,11 +759,11 @@ async function startServer() {
     // 2) Initialize data in parallel:
     console.log('Phase 1: Fetching initial data...');
     await Promise.all([
+      fetchLatestBlocks(),    // populates recentBlocks
       fetchInitialData(),    // stores in memory + broadcasts
-      fetchLatestBlocks()    // populates recentBlocks
     ]);
     console.log('Essential blockchain data loaded successfully');
-    
+
     // 3) Now explicitly load peer data
     console.log('Phase 2: Loading peer data...');
     try {
@@ -697,13 +799,19 @@ async function startServer() {
       });
     }, 600000); // Every 10 minutes
     
+    // Save cache to disk periodically
+    setInterval(() => {
+      saveCacheToDisk().catch(err => {
+        console.error('Error saving cache to disk:', err);
+      });
+    }, 60000); // Every minute
+
     // Final status report
     console.log("\n=== SERVER INITIALIZED SUCCESSFULLY ===");
     console.log(`Blocks loaded: ${recentBlocks.length}`);
     console.log(`Latest block: ${recentBlocks[0]?.height || 'None'}`);
     console.log(`Peers loaded: ${uniqueNodes.length}`);
     console.log("===================================\n");
-    
   } catch (error) {
     console.error('CRITICAL ERROR DURING STARTUP:', error);
     process.exit(1);

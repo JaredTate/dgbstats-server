@@ -50,6 +50,12 @@ const sendRpcRequest = async (method, params = [], skipCache = false) => {
     // Track pending requests
     pendingRequests++;
     
+    // Set timeout based on method - longer timeout for expensive calls
+    let timeout = 30000; // Default 30 seconds
+    if (method === 'gettxoutsetinfo') {
+      timeout = 120000; // 2 minutes for this heavy command
+    }
+    
     // Make the actual RPC call
     const response = await axios.post(
       rpcUrl,
@@ -64,7 +70,7 @@ const sendRpcRequest = async (method, params = [], skipCache = false) => {
           username: rpcUser,
           password: rpcPassword,
         },
-        timeout: 30000, // 30 second timeout
+        timeout: timeout,
       }
     );
 
@@ -86,7 +92,7 @@ const sendRpcRequest = async (method, params = [], skipCache = false) => {
       ttl = 3600; // Blocks don't change - cache for 1 hour
     }
     else if (method === 'gettxoutsetinfo') {
-      ttl = 300; // Heavy command - cache for 5 minutes
+      ttl = 3600; // Heavy command - cache for 1 hour since it's so expensive
     }
     
     rpcCache.set(cacheKey, result, ttl);
@@ -96,8 +102,10 @@ const sendRpcRequest = async (method, params = [], skipCache = false) => {
     pendingRequests--; // Make sure we decrement on error too
     
     console.error(`RPC Error (${method}):`, error.message);
-    if (error.response) {
-      console.error('Response data:', error.response.data);
+    
+    // Special handling for gettxoutsetinfo timeout
+    if (method === 'gettxoutsetinfo' && error.code === 'ECONNABORTED') {
+      console.log('gettxoutsetinfo timed out, this is normal for this heavy command');
     }
     
     // Return cached value if available (even if expired)
@@ -108,6 +116,22 @@ const sendRpcRequest = async (method, params = [], skipCache = false) => {
         console.log(`Returning stale cached result for ${method} due to error`);
         return cachedResult;
       }
+    }
+    
+    // For gettxoutsetinfo, return an estimated structure if we have no cached data
+    if (method === 'gettxoutsetinfo') {
+      console.log('Returning estimated UTXO set info');
+      return {
+        height: 0, // Will be updated later if possible
+        bestblock: "",
+        transactions: 0,
+        txouts: 0,
+        bogosize: 0,
+        hash_serialized_2: "",
+        disk_size: 0,
+        total_amount: 0,
+        _estimated: true // Flag to indicate this is an estimate
+      };
     }
     
     return null;
