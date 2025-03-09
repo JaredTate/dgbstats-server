@@ -356,14 +356,14 @@ app.get('/api/getpeers', (req, res) => {
   // First check if we have cached peer data (10 minute cache)
   const cachedPeers = peerCache.get('peerData');
   if (cachedPeers) {
-    console.log('Using cached peer data (expires in', Math.floor(peerCache.getTtl('peerData') / 1000), 'seconds)');
+    console.log('Using cached peer data (expires in', Math.floor((peerCache.getTtl('peerData') - Date.now()) / 1000), 'seconds)');
     return res.json(cachedPeers);
   }
   
   console.log('No cached peer data found, fetching fresh data...');
   const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
   
-  exec(`python3 ${pythonScriptPath}`, (error, stdout, stderr) => {
+  exec(`python3 ${pythonScriptPath}`, { timeout: 30000 }, (error, stdout, stderr) => {
     if (error) {
       console.error(`Error executing Python script: ${error.message}`);
       return res.status(500).json({ error: 'Error executing Python script' });
@@ -373,9 +373,22 @@ app.get('/api/getpeers', (req, res) => {
     }
 
     try {
+      // Make sure we have valid JSON output
+      if (!stdout || stdout.trim() === '') {
+        return res.status(500).json({ error: 'Empty response from peer script' });
+      }
+      
       const output = JSON.parse(stdout);
+      
+      // Validate output format
+      if (!output.uniqueIPv4Addresses || !output.uniqueIPv6Addresses) {
+        return res.status(500).json({ error: 'Invalid peer data format' });
+      }
+      
       const uniqueIPv4Addresses = output.uniqueIPv4Addresses;
       const uniqueIPv6Addresses = output.uniqueIPv6Addresses;
+      
+      console.log(`Parsed peer data: ${uniqueIPv4Addresses.length} IPv4, ${uniqueIPv6Addresses.length} IPv6 addresses`);
 
       // Geo-parse the IP addresses
       const geoData = [...uniqueIPv4Addresses, ...uniqueIPv6Addresses].map((ip) => {
@@ -388,6 +401,8 @@ app.get('/api/getpeers', (req, res) => {
           lon: geo?.ll?.[1] || 0
         };
       });
+      
+      console.log(`Geo-parsed ${geoData.length} IP addresses`);
 
       // Update DB
       db.serialize(() => {
@@ -443,6 +458,7 @@ app.get('/api/getpeers', (req, res) => {
       });
     } catch (parseError) {
       console.error(`Error parsing Python script output: ${parseError.message}`);
+      console.error('Raw output:', stdout);
       return res.status(500).json({ error: 'Error parsing Python script output' });
     }
   });
@@ -567,6 +583,7 @@ app.post('/api/refresh-peers', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Error refreshing peers:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -579,34 +596,50 @@ app.get('/health', (req, res) => {
   res.sendStatus(200);
 });
 
-// ------------------------- MAIN SERVER STARTUP -------------------------
+// ------------------------- STARTUP LOGIC -------------------------
 async function fetchPeersWithRetry() {
+  console.log("Starting peer data fetch...");
   const maxRetries = 3;
   const retryDelay = 5000; // 5 seconds
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // Optionally check if server is ready
+      console.log(`Peer fetch attempt ${attempt}/${maxRetries}`);
+      
+      // First check if server is ready
       const healthCheck = await axios.get(`http://localhost:${port}/health`).catch(() => null);
       if (!healthCheck) {
-        console.log(`Server not ready, attempt ${attempt}/${maxRetries}`);
+        console.log(`Server not ready for peer fetch, waiting ${retryDelay}ms...`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
         continue;
       }
-
+      
+      // Make direct request to local endpoint
       const response = await axios.get(`http://localhost:${port}/api/getpeers`);
-      console.log('Successfully fetched peers data');
-      return response.data;
+      
+      if (response.data && (response.data.uniqueIPv4Addresses || response.data.uniqueIPv6Addresses)) {
+        const ipv4Count = response.data.uniqueIPv4Addresses?.length || 0;
+        const ipv6Count = response.data.uniqueIPv6Addresses?.length || 0;
+        console.log(`Successfully fetched peer data: ${ipv4Count} IPv4 and ${ipv6Count} IPv6 addresses`);
+        return response.data;
+      } else {
+        console.warn("Peer data response was invalid:", response.data);
+        throw new Error("Invalid peer data response");
+      }
     } catch (error) {
-      console.log(`Peer fetch attempt ${attempt}/${maxRetries} failed`);
+      console.log(`Peer fetch attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+      
+      // On last attempt, try to return cached data if available
       if (attempt === maxRetries) {
         console.error('Max retries reached for peer fetch');
         if (peerCache.has('peerData')) {
-          console.log('All fetch attempts failed, using cached peer data');
+          console.log('Using previously cached peer data as fallback');
           return peerCache.get('peerData');
         }
-        throw new Error('Failed to fetch peer data');
+        throw new Error('Failed to fetch peer data after multiple attempts');
       }
+      
+      // Wait before retrying
       await new Promise(resolve => setTimeout(resolve, retryDelay));
     }
   }
@@ -628,8 +661,19 @@ async function startServer() {
       fetchLatestBlocks()    // populates recentBlocks
     ]);
     console.log('Essential blockchain data loaded successfully');
+    
+    // 3) Now explicitly load peer data
+    console.log('Phase 2: Loading peer data...');
+    try {
+      // Fetch peers directly from the peers.dat file
+      const peerData = await fetchPeersWithRetry();
+      console.log(`Successfully loaded peer data with ${uniqueNodes.length} nodes`);
+    } catch (peerError) {
+      console.error('Error loading peer data:', peerError);
+      console.log('Continuing without peer data - will retry in the background');
+    }
 
-    // 3) Periodic updates:
+    // 4) Set up periodic updates
     console.log('Setting up periodic data refresh cycles...');
     
     // Regularly update blocks
@@ -653,12 +697,11 @@ async function startServer() {
       });
     }, 600000); // Every 10 minutes
     
-    // Final status report - Fix the reference to rpcCache
+    // Final status report
     console.log("\n=== SERVER INITIALIZED SUCCESSFULLY ===");
     console.log(`Blocks loaded: ${recentBlocks.length}`);
     console.log(`Latest block: ${recentBlocks[0]?.height || 'None'}`);
     console.log(`Peers loaded: ${uniqueNodes.length}`);
-    // Remove or modify the reference to rpcCache.getStats()
     console.log("===================================\n");
     
   } catch (error) {
