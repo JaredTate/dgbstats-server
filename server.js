@@ -157,55 +157,96 @@ function decodeCoinbaseData(coinbaseHex) {
 // ------------------------- FETCH LATEST BLOCKS ON STARTUP -------------------------
 async function fetchLatestBlocks() {
   try {
+    console.log('Starting to fetch recent blocks...');
+    
     // 1) Get chain tip
     const blockchainInfo = await sendRpcRequest('getblockchaininfo');
+    if (!blockchainInfo) {
+      throw new Error('Unable to fetch blockchain info');
+    }
+    
     const latestBlockHeight = blockchainInfo.blocks;
     console.log('Latest block height:', latestBlockHeight);
 
-    // 2) Get blocks from last hour
-    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
-    const blocksBasic = await getBlocksByTimeRange(oneHourAgo, latestBlockHeight);
-
-    // 3) For each block, fetch full data
-    const fetchedFullBlocks = [];
-    for (const b of blocksBasic) {
-      const fullBlock = await sendRpcRequest('getblock', [b.hash, 2]);
-      if (!fullBlock || !fullBlock.tx?.[0]) continue;
-
-      const coinbaseTx = fullBlock.tx[0];
-      const firstOutputWithAddress = coinbaseTx.vout?.find(
-        (out) => out?.scriptPubKey?.address
-      );
-      const minerAddress = firstOutputWithAddress
-        ? firstOutputWithAddress.scriptPubKey.address
-        : '';
-
-      const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
-      const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
-
-      fetchedFullBlocks.push({
-        height: fullBlock.height,
-        hash: fullBlock.hash,
-        algo: getAlgoName(fullBlock.pow_algo),
-        txCount: fullBlock.nTx,
-        difficulty: fullBlock.difficulty,
-        timestamp: fullBlock.time,
-        minedTo: minerAddress,
-        minerAddress,
-        poolIdentifier,
-        taprootSignaling,
-        version: fullBlock.version
-      });
+    // 2) Clear existing blocks to avoid duplication
+    recentBlocks.length = 0;
+    
+    // 3) Calculate the range we need to fetch
+    // Request more blocks than needed to ensure we get enough
+    const requestedBlocks = Math.ceil(maxRecentBlocks * 1.1); // Request 10% more blocks
+    const startHeight = Math.max(1, latestBlockHeight - requestedBlocks);
+    
+    // 4) Fetch blocks - force start timestamp to 0 to get all blocks regardless of time
+    console.log(`Requesting ${requestedBlocks} blocks starting from height ${startHeight}`);
+    const blocksBasic = await getBlocksByTimeRange(0, latestBlockHeight, requestedBlocks);
+    
+    // 5) Add all fetched blocks
+    recentBlocks.push(...blocksBasic);
+    
+    // 6) If we still don't have enough blocks, fetch more individually
+    if (recentBlocks.length < maxRecentBlocks && latestBlockHeight >= maxRecentBlocks) {
+      console.log(`Only got ${recentBlocks.length} blocks, need ${maxRecentBlocks}. Fetching more...`);
+      
+      // Find the lowest height we already have
+      const lowestHeight = recentBlocks.reduce((min, block) => 
+        Math.min(min, block.height), Number.MAX_SAFE_INTEGER);
+      
+      // Fetch older blocks until we have enough
+      let currentHeight = lowestHeight - 1;
+      while (recentBlocks.length < maxRecentBlocks && currentHeight > 0) {
+        console.log(`Fetching additional block at height ${currentHeight}`);
+        try {
+          // Get block hash
+          const hash = await sendRpcRequest('getblockhash', [currentHeight]);
+          if (hash) {
+            // Get full block
+            const block = await sendRpcRequest('getblock', [hash, 2]);
+            if (block && block.tx && block.tx.length > 0) {
+              // Process block like in getBlocksByTimeRange
+              const coinbaseTx = block.tx[0];
+              const firstOutputWithAddress = coinbaseTx.vout?.find(
+                (out) => out?.scriptPubKey?.address
+              );
+              const minerAddress = firstOutputWithAddress
+                ? firstOutputWithAddress.scriptPubKey.address
+                : '';
+              
+              const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
+              const taprootSignaling = (block.version & (1 << 2)) !== 0;
+              
+              recentBlocks.push({
+                height: block.height,
+                hash: block.hash,
+                algo: getAlgoName(block.pow_algo),
+                txCount: block.nTx,
+                difficulty: block.difficulty,
+                timestamp: block.time,
+                minedTo: minerAddress,
+                minerAddress,
+                poolIdentifier,
+                taprootSignaling,
+                version: block.version
+              });
+            }
+          }
+        } catch (error) {
+          console.error(`Error fetching additional block at height ${currentHeight}:`, error.message);
+        }
+        
+        currentHeight--;
+      }
     }
 
-    // 4) Sort descending by height, keep up to 240
-    recentBlocks.push(...fetchedFullBlocks);
+    // 7) Sort and limit to exactly maxRecentBlocks
     recentBlocks.sort((a, b) => b.height - a.height);
     recentBlocks.splice(maxRecentBlocks);
-
-    console.log(`Loaded ${recentBlocks.length} preloaded blocks.`);
+    
+    console.log(`Loaded ${recentBlocks.length} blocks. Height range: ${recentBlocks[0]?.height || 'none'} to ${recentBlocks[recentBlocks.length-1]?.height || 'none'}`);
+    
+    return recentBlocks;
   } catch (error) {
     console.error('Error fetching latest blocks:', error);
+    return [];
   }
 }
 
@@ -423,7 +464,7 @@ app.use((req, res, next) => {
       }
 
       if (row.count === 0) {
-        db.run('INSERT INTO unique_ips (ip) VALUES (?)', [ip], (err) => {
+        db.run('INSERT INTO unique_ips (ip) VALUES (?)', (err) => {
           if (err) {
             console.error('Error inserting unique IP:', err);
           }
@@ -478,8 +519,13 @@ app.get('/api/cachestatus', (req, res) => {
     peerCount: uniqueNodes.length,
   };
 
+  // Fix the reference to rpcCache by checking if it's available from the imported module
+  const { rpcCache } = require('./rpc');
   const rpccacheInfo = {
-    stats: rpcCache ? getCacheStats() : null
+    stats: rpcCache ? { 
+      keys: rpcCache.keys().length,
+      // Don't access getCacheStats() since it might not exist
+    } : null
   };
 
   const cacheStatus = {
@@ -508,7 +554,7 @@ app.post('/api/refresh-peers', async (req, res) => {
     peerCache.del('peerData');
     peerCache.del('geoNodes');
     
-    // Fetch fresh data
+    // Fetch fresh data    
     const peerData = await fetchPeersWithRetry();
 
     res.json({
@@ -533,7 +579,7 @@ app.get('/health', (req, res) => {
   res.sendStatus(200);
 });
 
-// ------------------------- STARTUP LOGIC -------------------------
+// ------------------------- MAIN SERVER STARTUP -------------------------
 async function fetchPeersWithRetry() {
   const maxRetries = 3;
   const retryDelay = 5000; // 5 seconds
@@ -555,22 +601,17 @@ async function fetchPeersWithRetry() {
       console.log(`Peer fetch attempt ${attempt}/${maxRetries} failed`);
       if (attempt === maxRetries) {
         console.error('Max retries reached for peer fetch');
-        break;
+        if (peerCache.has('peerData')) {
+          console.log('All fetch attempts failed, using cached peer data');
+          return peerCache.get('peerData');
+        }
+        throw new Error('Failed to fetch peer data');
       }
       await new Promise(resolve => setTimeout(resolve, retryDelay));
     }
   }
-
-  // If all attempts failed but we have cached data, use that
-  if (peerCache.has('peerData')) {
-    console.log('All fetch attempts failed, using cached peer data');
-    return peerCache.get('peerData');
-  }
-
-  throw new Error('Failed to fetch peer data');
 }
 
-// ------------------------- MAIN SERVER STARTUP -------------------------
 async function startServer() {
   try {
     console.log('Starting DigiByte Stats server...');
@@ -588,19 +629,40 @@ async function startServer() {
     ]);
     console.log('Essential blockchain data loaded successfully');
 
-    console.log('Phase 2: Preloading peer data...');
-    await fetchPeersWithRetry();
-    console.log('Peer data loaded successfully');
-
     // 3) Periodic updates:
     console.log('Setting up periodic data refresh cycles...');
-    setInterval(fetchInitialData, 60000); // Every minute
-    setInterval(fetchLatestBlocks, 60000); // Every minute
-    setInterval(fetchPeersWithRetry, 600000); // Every 10 minutes for peers
-
-    console.log(`Ready to serve with ${recentBlocks.length} blocks and ${uniqueNodes.length} peers`);
+    
+    // Regularly update blocks
+    setInterval(() => {
+      fetchLatestBlocks().catch(err => {
+        console.error('Error in scheduled blocks update:', err);
+      });
+    }, 60000); // Every minute
+    
+    // Regularly update initial data
+    setInterval(() => {
+      fetchInitialData().catch(err => {
+        console.error('Error in scheduled data update:', err);
+      });
+    }, 60000); // Every minute
+    
+    // Update peers less frequently
+    setInterval(() => {
+      fetchPeersWithRetry().catch(err => {
+        console.error('Error in scheduled peer update:', err);
+      });
+    }, 600000); // Every 10 minutes
+    
+    // Final status report - Fix the reference to rpcCache
+    console.log("\n=== SERVER INITIALIZED SUCCESSFULLY ===");
+    console.log(`Blocks loaded: ${recentBlocks.length}`);
+    console.log(`Latest block: ${recentBlocks[0]?.height || 'None'}`);
+    console.log(`Peers loaded: ${uniqueNodes.length}`);
+    // Remove or modify the reference to rpcCache.getStats()
+    console.log("===================================\n");
+    
   } catch (error) {
-    console.error('Error during startup:', error);
+    console.error('CRITICAL ERROR DURING STARTUP:', error);
     process.exit(1);
   }
 }

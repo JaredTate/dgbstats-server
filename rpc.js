@@ -168,14 +168,27 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight, maxBlocks = 
   const blocks = [];
   const batchSize = 20;
   let currentHeight = endBlockHeight;
-  let attemptsRemaining = Math.min(500, maxBlocks * 1.2); // Safety to prevent infinite loops
+  let attemptsRemaining = Math.min(1000, maxBlocks * 2); // Increase max attempts
   let blocksToFetch = maxBlocks;
+  
+  // Track heights we've already processed to avoid duplicates
+  const processedHeights = new Set();
   
   while (blocks.length < maxBlocks && attemptsRemaining > 0 && currentHeight > 0) {
     try {
       // Fetch batch of block hashes
       const batchHashes = [];
       for (let i = 0; i < Math.min(batchSize, blocksToFetch); i++) {
+        if (currentHeight <= 0) break;
+        
+        // Skip heights we've already processed
+        if (processedHeights.has(currentHeight)) {
+          currentHeight--;
+          i--; // Don't count this as part of the batch
+          continue;
+        }
+        
+        processedHeights.add(currentHeight); // Mark as processed
         const hash = await sendRpcRequest('getblockhash', [currentHeight--]);
         if (hash) {
           batchHashes.push(hash);
@@ -260,6 +273,7 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight, maxBlocks = 
         blocksToFetch--;
         
         if (blocks.length >= maxBlocks) {
+          console.log(`Reached target of ${maxBlocks} blocks, stopping fetch`);
           break;
         }
       }
@@ -274,6 +288,8 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight, maxBlocks = 
       await new Promise(r => setTimeout(r, 500));
     }
   }
+  
+  console.log(`Completed block fetching: got ${blocks.length}/${maxBlocks} blocks after ${attemptsRemaining} attempts`);
   
   // Sort blocks by height (descending)
   blocks.sort((a, b) => b.height - a.height);
@@ -333,6 +349,32 @@ async function preloadEssentialData() {
     console.error('Error during preloading essential data:', error);
     return { success: false, error: error.message };
   }
+}
+
+// Add new helper function to improve block fetching performance
+async function fetchBlocksInBatch(hashes) {
+  const results = [];
+  const batchSize = 5; // Process in smaller batches to avoid overwhelming the RPC server
+  
+  for (let i = 0; i < hashes.length; i += batchSize) {
+    const batch = hashes.slice(i, i + batchSize);
+    
+    // Create batch of promises to fetch in parallel
+    const batchPromises = batch.map(hash => 
+      sendRpcRequest('getblock', [hash, 2])
+    );
+    
+    // Wait for all promises in this mini-batch
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+    
+    // Add small delay between batches
+    if (i + batchSize < hashes.length) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+  
+  return results;
 }
 
 router.get('/getblockchaininfo', async (req, res) => {
@@ -473,5 +515,6 @@ module.exports = {
   preloadEssentialData,
   getCacheStats,
   resetCacheStats,
-  rpcCache
+  rpcCache,
+  fetchBlocksInBatch
 };
