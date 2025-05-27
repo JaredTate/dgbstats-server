@@ -1,0 +1,101 @@
+{
+  "initialData": {
+    "blockchainInfo": {
+      "chain": "main",
+      "blocks": 21458936,
+      "headers": 21458936,
+      "bestblockhash": "f30b60013e649e5905a3d5cd16577c9a5ade9726644df0c6291e7c60a6814fb1",
+      "mediantime": 1748368184,
+      "verificationprogress": 0.9999999877026807,
+      "initialblockdownload": false,
+      "chainwork": "00000000000000000000000000000000000000000018a9390b5f394def9b904c",
+      "size_on_disk": 33712651348,
+      "pruned": false,
+      "difficulties": {
+        "sha256d": 989164382.6597412,
+        "scrypt": 287318.33153372,
+        "skein": 11086858.563088,
+        "qubit": 450833.6260560504,
+        "odo": 125850.5511764878
+      },
+      "softforks": {
+        "bip34": {
+          "type": "buried",
+          "active": true,
+          "height": 4394880
+        },
+        "bip66": {
+          "type": "buried",
+          "active": true,
+          "height": 4394880
+        },
+        "bip65": {
+          "type": "buried",
+          "active": true,
+          "height": 4394880
+        },
+        "csv": {
+          "type": "buried",
+          "active": true,
+          "height": 4394880
+        },
+        "segwit": {
+          "type": "buried",
+          "active": true,
+          "height": 4394880
+        },
+        "testdummy": {
+          "type": "bip9",
+          "bip9": {
+            "status": "failed",
+            "start_time": 1199145601,
+            "timeout": 1230767999,
+            "since": 80640,
+            "min_activation_height": 0
+          },
+          "active": false
+        },
+        "odo": {
+          "type": "buried",
+          "active": true,
+          "height": 9112320
+        },
+        "taproot": {
+          "type": "bip9",
+          "bip9": {
+            "status": "active",
+            "start_time": 1736510438,
+            "timeout": 1799582438,
+            "since": 21168000,
+            "min_activation_height": 0
+          },
+          "height": 21168000,
+          "active": true
+        }
+      },
+      "warnings": ""
+    },
+    "chainTxStats": {
+      "time": 1748368245,
+      "txcount": 50618043,
+      "window_final_block_hash": "f30b60013e649e5905a3d5cd16577c9a5ade9726644df0c6291e7c60a6814fb1",
+      "window_final_block_height": 21458936,
+      "window_block_count": 172800,
+      "window_tx_count": 282285,
+      "window_interval": 2582682,
+      "txrate": 0.1092991703972847
+    },
+    "txOutsetInfo": {
+      "height": 21458923,
+      "bestblock": "f360140c5de9131aabcccc971fa43027794136626ab4f936855ade3437730144",
+      "txouts": 14984821,
+      "bogosize": 1122580757,
+      "hash_serialized_2": "69bdb883c9e419d2625c97f79fd52dc1981aac9ddcc8f654e9e10907c9569aaf",
+      "total_amount": 17713443222.147083,
+      "transactions": 4085653,
+      "disk_size": 803897317
+    },
+    "blockReward": 300.04549168
+  },
+  "timestamp": 1748368310676
+}

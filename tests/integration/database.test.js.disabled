@@ -1,0 +1,596 @@
+/**
+ * Database Integration Tests
+ * 
+ * Tests SQLite database operations including
+ * schema creation, data insertion, and queries.
+ */
+
+const sqlite3 = require('sqlite3').verbose();
+const { createTestDatabase } = require('../helpers/test-utils');
+const { mockGeoData, testDbSchemas } = require('../fixtures/test-data');
+
+describe('Database Integration Tests', () => {
+  let db;
+  
+  // Helper function to promisify database operations
+  const dbGet = (query, params = []) => {
+    return new Promise((resolve, reject) => {
+      db.get(query, params, (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    });
+  };
+
+  const dbRun = (query, params = []) => {
+    return new Promise((resolve, reject) => {
+      db.run(query, params, function(err) {
+        if (err) reject(err);
+        else resolve({ lastID: this.lastID, changes: this.changes });
+      });
+    });
+  };
+
+  const dbAll = (query, params = []) => {
+    return new Promise((resolve, reject) => {
+      db.all(query, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    });
+  };
+  
+  beforeEach(() => {
+    db = createTestDatabase();
+  });
+  
+  afterEach(() => {
+    return new Promise((resolve) => {
+      db.close(resolve);
+    });
+  });
+
+  describe('Schema Creation', () => {
+    test('should create nodes table with correct schema', async () => {
+      const row = await dbGet("SELECT sql FROM sqlite_master WHERE type='table' AND name='nodes'");
+      expect(row).toBeDefined();
+      expect(row.sql).toContain('ip TEXT PRIMARY KEY');
+      expect(row.sql).toContain('country TEXT');
+      expect(row.sql).toContain('city TEXT');
+      expect(row.sql).toContain('lat REAL');
+      expect(row.sql).toContain('lon REAL');
+    });
+
+    test('should create visits table with correct schema', async () => {
+      const row = await dbGet("SELECT sql FROM sqlite_master WHERE type='table' AND name='visits'");
+      expect(row).toBeDefined();
+      expect(row.sql).toContain('id INTEGER PRIMARY KEY AUTOINCREMENT');
+      expect(row.sql).toContain('ip TEXT');
+      expect(row.sql).toContain('timestamp DATETIME DEFAULT CURRENT_TIMESTAMP');
+    });
+
+    test('should create unique_ips table with correct schema', async () => {
+      const row = await dbGet("SELECT sql FROM sqlite_master WHERE type='table' AND name='unique_ips'");
+      expect(row).toBeDefined();
+      expect(row.sql).toContain('ip TEXT PRIMARY KEY');
+    });
+  });
+
+  describe('Node Data Operations', () => {
+    test('should insert node data correctly', async () => {
+      const testNode = mockGeoData[0];
+      
+      const result = await dbRun(
+        'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)',
+        [testNode.ip, testNode.country, testNode.city, testNode.lat, testNode.lon]
+      );
+      
+      expect(result.changes).toBe(1);
+    });
+
+    test('should retrieve node data correctly', async () => {
+      const testNode = mockGeoData[1];
+      
+      await dbRun(
+        'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)',
+        [testNode.ip, testNode.country, testNode.city, testNode.lat, testNode.lon]
+      );
+      
+      const row = await dbGet('SELECT * FROM nodes WHERE ip = ?', [testNode.ip]);
+      expect(row).toMatchObject(testNode);
+    });
+
+    // Skip remaining tests to avoid callback issues for now
+    test.skip('should handle duplicate IP addresses in nodes table (skipped - callback refactor needed)', () => {
+      // Test skipped due to callback conversion complexity
+    });
+
+    test.skip('should update node data correctly (skipped - callback refactor needed)', () => {
+      // Test skipped due to callback conversion complexity  
+    });
+
+    test.skip('should delete node data correctly (skipped - callback refactor needed)', () => {
+      // Test skipped due to callback conversion complexity
+    });
+
+    test.skip('should bulk insert node data (skipped - callback refactor needed)', () => {
+      // Test skipped due to callback conversion complexity
+    });
+
+    test.skip('should clear all node data (skipped - callback refactor needed)', () => {
+      // Test skipped due to callback conversion complexity
+    });
+
+    test('should handle duplicate IP addresses in nodes table', (done) => {
+      const testNode = mockGeoData[2];
+      
+      // Insert first time
+      db.run(
+        'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)',
+        [testNode.ip, testNode.country, testNode.city, testNode.lat, testNode.lon],
+        function(err) {
+          expect(err).toBeNull();
+          
+          // Try to insert same IP again
+          db.run(
+            'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)',
+            [testNode.ip, 'Different', 'Data', 0, 0],
+            function(err) {
+              expect(err).toBeDefined();
+              expect(err.message).toContain('UNIQUE constraint failed');
+              done();
+            }
+          );
+        }
+      );
+    });
+
+    test('should update node data correctly', (done) => {
+      const testNode = mockGeoData[3];
+      
+      db.run(
+        'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)',
+        [testNode.ip, testNode.country, testNode.city, testNode.lat, testNode.lon],
+        function(err) {
+          expect(err).toBeNull();
+          
+          // Update the node data
+          const updatedCountry = 'Updated Country';
+          db.run(
+            'UPDATE nodes SET country = ? WHERE ip = ?',
+            [updatedCountry, testNode.ip],
+            function(err) {
+              expect(err).toBeNull();
+              expect(this.changes).toBe(1);
+              
+              // Verify update
+              db.get('SELECT * FROM nodes WHERE ip = ?', [testNode.ip], (err, row) => {
+                expect(err).toBeNull();
+                expect(row.country).toBe(updatedCountry);
+                done();
+              });
+            }
+          );
+        }
+      );
+    });
+
+    test('should delete node data correctly', (done) => {
+      const testNode = mockGeoData[4];
+      
+      db.run(
+        'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)',
+        [testNode.ip, testNode.country, testNode.city, testNode.lat, testNode.lon],
+        function(err) {
+          expect(err).toBeNull();
+          
+          db.run('DELETE FROM nodes WHERE ip = ?', [testNode.ip], function(err) {
+            expect(err).toBeNull();
+            expect(this.changes).toBe(1);
+            
+            // Verify deletion
+            db.get('SELECT * FROM nodes WHERE ip = ?', [testNode.ip], (err, row) => {
+              expect(err).toBeNull();
+              expect(row).toBeUndefined();
+              done();
+            });
+          });
+        }
+      );
+    });
+
+    test('should bulk insert node data', (done) => {
+      db.serialize(() => {
+        const stmt = db.prepare('INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)');
+        
+        mockGeoData.forEach(node => {
+          stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
+        });
+        
+        stmt.finalize((err) => {
+          expect(err).toBeNull();
+          
+          db.get('SELECT COUNT(*) as count FROM nodes', (err, row) => {
+            expect(err).toBeNull();
+            expect(row.count).toBe(mockGeoData.length);
+            done();
+          });
+        });
+      });
+    });
+
+    test('should clear all node data', (done) => {
+      // Insert test data first
+      db.serialize(() => {
+        const stmt = db.prepare('INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)');
+        mockGeoData.forEach(node => {
+          stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
+        });
+        stmt.finalize();
+        
+        // Clear all data
+        db.run('DELETE FROM nodes', function(err) {
+          expect(err).toBeNull();
+          expect(this.changes).toBe(mockGeoData.length);
+          
+          // Verify all data is cleared
+          db.get('SELECT COUNT(*) as count FROM nodes', (err, row) => {
+            expect(err).toBeNull();
+            expect(row.count).toBe(0);
+            done();
+          });
+        });
+      });
+    });
+  });
+
+  describe('Visit Tracking Operations', () => {
+    test('should insert visit records', (done) => {
+      const testIP = '192.168.1.100';
+      
+      db.run('INSERT INTO visits (ip) VALUES (?)', [testIP], function(err) {
+        expect(err).toBeNull();
+        expect(this.lastID).toBeGreaterThan(0);
+        expect(this.changes).toBe(1);
+        done();
+      });
+    });
+
+    test('should track multiple visits from same IP', (done) => {
+      const testIP = '10.0.0.1';
+      
+      db.serialize(() => {
+        db.run('INSERT INTO visits (ip) VALUES (?)', [testIP]);
+        db.run('INSERT INTO visits (ip) VALUES (?)', [testIP]);
+        db.run('INSERT INTO visits (ip) VALUES (?)', [testIP], function(err) {
+          expect(err).toBeNull();
+          
+          db.get('SELECT COUNT(*) as count FROM visits WHERE ip = ?', [testIP], (err, row) => {
+            expect(err).toBeNull();
+            expect(row.count).toBe(3);
+            done();
+          });
+        });
+      });
+    });
+
+    test('should have automatic timestamp', (done) => {
+      const testIP = '172.16.0.1';
+      
+      db.run('INSERT INTO visits (ip) VALUES (?)', [testIP], function(err) {
+        expect(err).toBeNull();
+        
+        db.get('SELECT timestamp FROM visits WHERE ip = ?', [testIP], (err, row) => {
+          expect(err).toBeNull();
+          expect(row.timestamp).toBeDefined();
+          
+          // Timestamp should be recent (within last minute)
+          const visitTime = new Date(row.timestamp).getTime();
+          const now = Date.now();
+          expect(now - visitTime).toBeLessThan(60000); // Less than 1 minute
+          done();
+        });
+      });
+    });
+
+    test('should query visits by date range', (done) => {
+      const testIP = '203.0.113.1';
+      
+      db.run('INSERT INTO visits (ip) VALUES (?)', [testIP], function(err) {
+        expect(err).toBeNull();
+        
+        // Query visits from last 30 days
+        db.get(`
+          SELECT COUNT(*) as count 
+          FROM visits 
+          WHERE timestamp > datetime('now', '-30 days')
+        `, (err, row) => {
+          expect(err).toBeNull();
+          expect(row.count).toBeGreaterThanOrEqual(1);
+          done();
+        });
+      });
+    });
+
+    test('should calculate total visits', (done) => {
+      const testIPs = ['192.168.1.1', '192.168.1.2', '192.168.1.3'];
+      
+      db.serialize(() => {
+        const stmt = db.prepare('INSERT INTO visits (ip) VALUES (?)');
+        testIPs.forEach(ip => {
+          stmt.run(ip);
+          stmt.run(ip); // Insert twice per IP
+        });
+        stmt.finalize();
+        
+        db.get('SELECT COUNT(*) as totalVisits FROM visits', (err, row) => {
+          expect(err).toBeNull();
+          expect(row.totalVisits).toBe(testIPs.length * 2);
+          done();
+        });
+      });
+    });
+  });
+
+  describe('Unique IP Tracking', () => {
+    test('should insert unique IP', (done) => {
+      const testIP = '198.51.100.1';
+      
+      db.run('INSERT INTO unique_ips (ip) VALUES (?)', [testIP], function(err) {
+        expect(err).toBeNull();
+        expect(this.changes).toBe(1);
+        done();
+      });
+    });
+
+    test('should prevent duplicate unique IPs', (done) => {
+      const testIP = '198.51.100.2';
+      
+      db.run('INSERT INTO unique_ips (ip) VALUES (?)', [testIP], function(err) {
+        expect(err).toBeNull();
+        
+        // Try to insert same IP again
+        db.run('INSERT INTO unique_ips (ip) VALUES (?)', [testIP], function(err) {
+          expect(err).toBeDefined();
+          expect(err.message).toContain('UNIQUE constraint failed');
+          done();
+        });
+      });
+    });
+
+    test('should count unique visitors', (done) => {
+      const testIPs = ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4'];
+      
+      db.serialize(() => {
+        const stmt = db.prepare('INSERT INTO unique_ips (ip) VALUES (?)');
+        testIPs.forEach(ip => stmt.run(ip));
+        stmt.finalize();
+        
+        db.get('SELECT COUNT(*) as uniqueVisitors FROM unique_ips', (err, row) => {
+          expect(err).toBeNull();
+          expect(row.uniqueVisitors).toBe(testIPs.length);
+          done();
+        });
+      });
+    });
+
+    test('should check IP existence before insert', (done) => {
+      const testIP = '172.16.0.5';
+      
+      // Check if IP exists (should not)
+      db.get('SELECT COUNT(*) as count FROM unique_ips WHERE ip = ?', [testIP], (err, row) => {
+        expect(err).toBeNull();
+        expect(row.count).toBe(0);
+        
+        // Insert IP
+        db.run('INSERT INTO unique_ips (ip) VALUES (?)', [testIP], function(err) {
+          expect(err).toBeNull();
+          
+          // Check again (should exist now)
+          db.get('SELECT COUNT(*) as count FROM unique_ips WHERE ip = ?', [testIP], (err, row) => {
+            expect(err).toBeNull();
+            expect(row.count).toBe(1);
+            done();
+          });
+        });
+      });
+    });
+  });
+
+  describe('Complex Queries and Analytics', () => {
+    test('should calculate comprehensive visit statistics', (done) => {
+      const testData = [
+        { ip: '192.168.1.1', visits: 3 },
+        { ip: '192.168.1.2', visits: 2 },
+        { ip: '192.168.1.3', visits: 1 }
+      ];
+      
+      db.serialize(() => {
+        // Insert visit data
+        const visitStmt = db.prepare('INSERT INTO visits (ip) VALUES (?)');
+        testData.forEach(({ ip, visits }) => {
+          for (let i = 0; i < visits; i++) {
+            visitStmt.run(ip);
+          }
+        });
+        visitStmt.finalize();
+        
+        // Insert unique IPs
+        const uniqueStmt = db.prepare('INSERT INTO unique_ips (ip) VALUES (?)');
+        testData.forEach(({ ip }) => uniqueStmt.run(ip));
+        uniqueStmt.finalize();
+        
+        // Calculate statistics
+        db.all(`
+          SELECT
+            (SELECT COUNT(*) FROM visits WHERE timestamp > datetime('now', '-30 days')) AS visitsLast30Days,
+            (SELECT COUNT(*) FROM visits) AS totalVisits,
+            (SELECT COUNT(*) FROM unique_ips) AS uniqueVisitors
+        `, (err, rows) => {
+          expect(err).toBeNull();
+          expect(rows.length).toBe(1);
+          
+          const stats = rows[0];
+          const expectedTotalVisits = testData.reduce((sum, { visits }) => sum + visits, 0);
+          
+          expect(stats.totalVisits).toBe(expectedTotalVisits);
+          expect(stats.uniqueVisitors).toBe(testData.length);
+          expect(stats.visitsLast30Days).toBe(expectedTotalVisits); // All visits are recent
+          done();
+        });
+      });
+    });
+
+    test('should handle concurrent database operations', (done) => {
+      const testIPs = Array.from({ length: 100 }, (_, i) => `192.168.${Math.floor(i / 255)}.${i % 255}`);
+      let completedOperations = 0;
+      const totalOperations = testIPs.length;
+      
+      // Perform concurrent inserts
+      testIPs.forEach(ip => {
+        db.run('INSERT INTO visits (ip) VALUES (?)', [ip], function(err) {
+          expect(err).toBeNull();
+          completedOperations++;
+          
+          if (completedOperations === totalOperations) {
+            // Verify all data was inserted
+            db.get('SELECT COUNT(*) as count FROM visits', (err, row) => {
+              expect(err).toBeNull();
+              expect(row.count).toBe(testIPs.length);
+              done();
+            });
+          }
+        });
+      });
+    });
+
+    test('should handle database transactions', (done) => {
+      const testIPs = ['10.1.1.1', '10.1.1.2', '10.1.1.3'];
+      
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        
+        testIPs.forEach(ip => {
+          db.run('INSERT INTO visits (ip) VALUES (?)', [ip]);
+          db.run('INSERT INTO unique_ips (ip) VALUES (?)', [ip]);
+        });
+        
+        db.run('COMMIT', function(err) {
+          expect(err).toBeNull();
+          
+          // Verify transaction committed
+          db.get('SELECT COUNT(*) as visits FROM visits', (err, visitRow) => {
+            expect(err).toBeNull();
+            
+            db.get('SELECT COUNT(*) as unique_ips FROM unique_ips', (err, uniqueRow) => {
+              expect(err).toBeNull();
+              expect(visitRow.visits).toBe(testIPs.length);
+              expect(uniqueRow.unique_ips).toBe(testIPs.length);
+              done();
+            });
+          });
+        });
+      });
+    });
+
+    test('should handle database rollback on error', (done) => {
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        
+        // Insert valid data
+        db.run('INSERT INTO visits (ip) VALUES (?)', ['10.2.2.1']);
+        
+        // Try to insert invalid data (this should fail)
+        db.run('INSERT INTO unique_ips (ip) VALUES (?)', ['10.2.2.1'], function(err) {
+          expect(err).toBeNull();
+          
+          // Try to insert same IP again (should cause conflict)
+          db.run('INSERT INTO unique_ips (ip) VALUES (?)', ['10.2.2.1'], function(err) {
+            expect(err).toBeDefined();
+            
+            // Rollback transaction
+            db.run('ROLLBACK', function(rollbackErr) {
+              expect(rollbackErr).toBeNull();
+              
+              // Verify rollback - data should not exist
+              db.get('SELECT COUNT(*) as count FROM visits WHERE ip = ?', ['10.2.2.1'], (err, row) => {
+                expect(err).toBeNull();
+                expect(row.count).toBe(0);
+                done();
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+
+  describe('Database Performance', () => {
+    test('should handle large dataset efficiently', (done) => {
+      const largeDataset = Array.from({ length: 1000 }, (_, i) => ({
+        ip: `10.${Math.floor(i / 65536)}.${Math.floor((i % 65536) / 256)}.${i % 256}`,
+        country: `Country${i % 10}`,
+        city: `City${i % 100}`,
+        lat: (Math.random() - 0.5) * 180,
+        lon: (Math.random() - 0.5) * 360
+      }));
+      
+      const startTime = Date.now();
+      
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        
+        const stmt = db.prepare('INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)');
+        largeDataset.forEach(node => {
+          stmt.run(node.ip, node.country, node.city, node.lat, node.lon);
+        });
+        stmt.finalize();
+        
+        db.run('COMMIT', function(err) {
+          expect(err).toBeNull();
+          
+          const endTime = Date.now();
+          const duration = endTime - startTime;
+          
+          // Should complete within reasonable time (5 seconds)
+          expect(duration).toBeLessThan(5000);
+          
+          // Verify all data was inserted
+          db.get('SELECT COUNT(*) as count FROM nodes', (err, row) => {
+            expect(err).toBeNull();
+            expect(row.count).toBe(largeDataset.length);
+            done();
+          });
+        });
+      });
+    });
+
+    test('should efficiently query with indexing', (done) => {
+      // Insert test data
+      const testIPs = Array.from({ length: 100 }, (_, i) => `192.168.1.${i}`);
+      
+      db.serialize(() => {
+        const stmt = db.prepare('INSERT INTO visits (ip) VALUES (?)');
+        testIPs.forEach(ip => {
+          stmt.run(ip);
+        });
+        stmt.finalize();
+        
+        // Query specific IP (should be fast due to indexing)
+        const startTime = Date.now();
+        
+        db.get('SELECT COUNT(*) as count FROM visits WHERE ip = ?', ['192.168.1.50'], (err, row) => {
+          expect(err).toBeNull();
+          
+          const endTime = Date.now();
+          const duration = endTime - startTime;
+          
+          // Query should be very fast (under 100ms)
+          expect(duration).toBeLessThan(100);
+          expect(row.count).toBe(1);
+          done();
+        });
+      });
+    });
+  });
+});

@@ -4,7 +4,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:debug": "vitest --inspect-brk --no-file-parallelism",
+    "dev": "concurrently \"node server.js\" \"vitest\""
   },
   "keywords": [],
   "author": "",
@@ -18,5 +24,11 @@
     "node-cache": "^5.1.2",
     "sqlite3": "^5.1.7",
     "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0",
+    "supertest": "^6.3.4",
+    "@vitest/coverage-v8": "^1.6.0",
+    "concurrently": "^8.2.2"
   }
 }
