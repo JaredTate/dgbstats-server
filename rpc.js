@@ -1,183 +1,328 @@
+/**
+ * DigiByte RPC Interface Module
+ * 
+ * This module provides a comprehensive interface to DigiByte's RPC server with:
+ * - Smart caching system to reduce server load
+ * - Rate limiting to prevent overwhelming the node
+ * - Automatic retry and fallback mechanisms
+ * - Enhanced block fetching for the stats dashboard
+ * 
+ * @author DigiByte Stats Server
+ * @version 1.0.0
+ */
+
+// ============================================================================
+// DEPENDENCIES
+// ============================================================================
+
 const express = require('express');
 const axios = require('axios');
 const geoip = require('geoip-lite');
-const router = express.Router();
-const NodeCache = require('node-cache');
 const crypto = require('crypto');
+const NodeCache = require('node-cache');
 
-// Create a shared cache for all RPC requests - 1 minute TTL by default
-const rpcCache = new NodeCache({ stdTTL: 60, checkperiod: 30 });
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
-// Stats tracking for monitoring
-let totalRequests = 0;
-let cacheHits = 0;
-let cacheMisses = 0;
+// RPC Connection Settings
+const RPC_CONFIG = {
+  user: 'user',
+  password: 'password', 
+  url: 'http://127.0.0.1:14044',
+  timeout: {
+    default: 30000,      // 30 seconds for most commands
+    heavy: 120000        // 2 minutes for expensive operations like gettxoutsetinfo
+  }
+};
 
-// Replace with your DigiByte RPC credentials and URL
-const rpcUser = 'user';
-const rpcPassword = 'password';
-const rpcUrl = 'http://127.0.0.1:14044';
+// Rate Limiting Configuration
+const RATE_LIMIT = {
+  maxConcurrent: 4,     // Maximum concurrent RPC requests
+  batchSize: 20,        // Size of batches when fetching multiple blocks
+  batchDelay: 200       // Delay between batches in milliseconds
+};
 
-// Limit concurrent RPC requests to avoid overloading
-let pendingRequests = 0;
-const MAX_CONCURRENT_REQUESTS = 4;
+// Cache Configuration with TTL settings for different data types
+const CACHE_CONFIG = {
+  default: 60,          // 1 minute default TTL
+  blocks: 3600,         // 1 hour for blocks (immutable)
+  heavy: 3600,          // 1 hour for expensive operations
+  checkPeriod: 30       // Cache cleanup interval
+};
 
-// Enhanced RPC function with caching and rate limiting
-const sendRpcRequest = async (method, params = [], skipCache = false) => {
-  totalRequests++;
+// ============================================================================
+// CACHE AND STATISTICS
+// ============================================================================
+
+/**
+ * Shared cache instance for all RPC requests
+ * Uses smart TTL based on data type and request patterns
+ */
+const rpcCache = new NodeCache({ 
+  stdTTL: CACHE_CONFIG.default, 
+  checkperiod: CACHE_CONFIG.checkPeriod 
+});
+
+/**
+ * Statistics tracking for cache performance monitoring
+ */
+const stats = {
+  totalRequests: 0,
+  cacheHits: 0,
+  cacheMisses: 0,
+  pendingRequests: 0
+};
+
+// ============================================================================
+// CORE RPC FUNCTIONALITY
+// ============================================================================
+
+/**
+ * Enhanced RPC request function with intelligent caching and rate limiting
+ * 
+ * Features:
+ * - MD5-based cache keys for parameter-aware caching
+ * - Configurable cache TTL based on request type
+ * - Graceful degradation with stale cache fallback
+ * - Rate limiting to prevent node overload
+ * 
+ * @param {string} method - RPC method name
+ * @param {Array} params - Parameters for the RPC call
+ * @param {boolean} skipCache - Force bypass cache for fresh data
+ * @returns {Promise<any>} RPC response data
+ */
+async function sendRpcRequest(method, params = [], skipCache = false) {
+  stats.totalRequests++;
   
   try {
-    // Generate a unique cache key based on method and parameters
-    const cacheKey = `rpc:${method}:${crypto.createHash('md5').update(JSON.stringify(params)).digest('hex')}`;
+    // Generate unique cache key based on method and parameters
+    const cacheKey = generateCacheKey(method, params);
     
-    // Check cache first (unless skipCache is true)
+    // Check cache first (unless explicitly skipped)
     if (!skipCache) {
       const cachedResult = rpcCache.get(cacheKey);
       if (cachedResult !== undefined) {
-        cacheHits++;
+        stats.cacheHits++;
         return cachedResult;
       }
     }
     
-    // Cache miss
-    cacheMisses++;
+    // Cache miss - need to make RPC call
+    stats.cacheMisses++;
     
-    // Simple rate limiting
-    while (pendingRequests >= MAX_CONCURRENT_REQUESTS) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+    // Apply rate limiting
+    await waitForAvailableSlot();
     
-    // Track pending requests
-    pendingRequests++;
+    // Track this request
+    stats.pendingRequests++;
     
-    // Set timeout based on method - longer timeout for expensive calls
-    let timeout = 30000; // Default 30 seconds
-    if (method === 'gettxoutsetinfo') {
-      timeout = 120000; // 2 minutes for this heavy command
-    }
-    
-    // Make the actual RPC call
-    const response = await axios.post(
-      rpcUrl,
-      {
+    try {
+      // Configure timeout based on method type
+      const timeout = getTimeoutForMethod(method);
+      
+      // Make the RPC call
+      const response = await axios.post(RPC_CONFIG.url, {
         jsonrpc: '1.0',
         id: 'dgb_rpc',
         method: method,
         params: params,
-      },
-      {
+      }, {
         auth: {
-          username: rpcUser,
-          password: rpcPassword,
+          username: RPC_CONFIG.user,
+          password: RPC_CONFIG.password,
         },
         timeout: timeout,
+      });
+
+      // Release the request slot
+      stats.pendingRequests--;
+
+      // Check for RPC errors
+      if (response.data.error) {
+        throw new Error(`RPC Error: ${JSON.stringify(response.data.error)}`);
       }
-    );
-
-    // Done with this request
-    pendingRequests--;
-
-    if (response.data.error) {
-      throw new Error(`RPC Error: ${JSON.stringify(response.data.error)}`);
+      
+      const result = response.data.result;
+      
+      // Cache the result with appropriate TTL
+      cacheResultWithSmartTTL(cacheKey, result, method);
+      
+      return result;
+      
+    } catch (requestError) {
+      // Always decrement pending requests on error
+      stats.pendingRequests--;
+      throw requestError;
     }
     
-    // Get result
-    const result = response.data.result;
-    
-    // Cache the result with appropriate TTL based on method
-    let ttl = 60; // Default: 60 seconds
-    
-    // Adjust TTL based on command type
-    if (method === 'getblock' || method === 'getblockhash') {
-      ttl = 3600; // Blocks don't change - cache for 1 hour
-    }
-    else if (method === 'gettxoutsetinfo') {
-      ttl = 3600; // Heavy command - cache for 1 hour since it's so expensive
-    }
-    
-    rpcCache.set(cacheKey, result, ttl);
-    
-    return result;
   } catch (error) {
-    pendingRequests--; // Make sure we decrement on error too
-    
     console.error(`RPC Error (${method}):`, error.message);
     
-    // Special handling for gettxoutsetinfo timeout
+    // Special handling for known timeout issues
     if (method === 'gettxoutsetinfo' && error.code === 'ECONNABORTED') {
-      console.log('gettxoutsetinfo timed out, this is normal for this heavy command');
+      console.log('gettxoutsetinfo timed out - this is normal for this heavy command');
     }
     
-    // Return cached value if available (even if expired)
-    if (!skipCache) {
-      const cacheKey = `rpc:${method}:${crypto.createHash('md5').update(JSON.stringify(params)).digest('hex')}`;
-      const cachedResult = rpcCache.get(cacheKey, true); // Get even if expired
-      if (cachedResult !== undefined) {
-        console.log(`Returning stale cached result for ${method} due to error`);
-        return cachedResult;
-      }
+    // Try to return stale cached data as fallback
+    const staleResult = attemptStaleDataRecovery(method, params);
+    if (staleResult !== null) {
+      return staleResult;
     }
     
-    // For gettxoutsetinfo, return an estimated structure if we have no cached data
+    // For critical methods, return estimated data rather than failing
     if (method === 'gettxoutsetinfo') {
-      console.log('Returning estimated UTXO set info');
-      return {
-        height: 0, // Will be updated later if possible
-        bestblock: "",
-        transactions: 0,
-        txouts: 0,
-        bogosize: 0,
-        hash_serialized_2: "",
-        disk_size: 0,
-        total_amount: 0,
-        _estimated: true // Flag to indicate this is an estimate
-      };
+      return generateEstimatedUTXOData();
     }
     
     return null;
   }
-};
-
-// Get cache statistics
-function getCacheStats() {
-  return {
-    keys: rpcCache.keys().length,
-    hits: cacheHits,
-    misses: cacheMisses,
-    total: totalRequests,
-    hitRate: totalRequests > 0 ? (cacheHits / totalRequests * 100).toFixed(1) + '%' : '0%',
-    pendingRequests
-  };
 }
 
-// Reset cache stats
-function resetCacheStats() {
-  totalRequests = 0;
-  cacheHits = 0;
-  cacheMisses = 0;
+/**
+ * Generate a unique cache key based on method and parameters
+ * 
+ * @param {string} method - RPC method
+ * @param {Array} params - Method parameters
+ * @returns {string} MD5 hash cache key
+ */
+function generateCacheKey(method, params) {
+  const paramsHash = crypto.createHash('md5')
+    .update(JSON.stringify(params))
+    .digest('hex');
+  return `rpc:${method}:${paramsHash}`;
 }
 
-// Get algo name
-function getAlgoName(algo) {
-  switch (algo) {
-    case 'sha256d':
-      return 'SHA256D';
-    case 'scrypt':
-      return 'Scrypt';
-    case 'skein':
-      return 'Skein';
-    case 'qubit':
-      return 'Qubit';
-    case 'odo':
-      return 'Odo';
-    default:
-      return 'Unknown';
+/**
+ * Apply rate limiting by waiting for available request slots
+ * Uses exponential backoff to prevent thundering herd
+ */
+async function waitForAvailableSlot() {
+  let waitTime = 100; // Start with 100ms
+  
+  while (stats.pendingRequests >= RATE_LIMIT.maxConcurrent) {
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+    waitTime = Math.min(waitTime * 1.1, 1000); // Cap at 1 second
   }
 }
 
-// Enhanced getBlocksByTimeRange with better caching and error handling
+/**
+ * Get appropriate timeout for different RPC methods
+ * 
+ * @param {string} method - RPC method name
+ * @returns {number} Timeout in milliseconds
+ */
+function getTimeoutForMethod(method) {
+  const heavyMethods = ['gettxoutsetinfo', 'getblockhash', 'getblock'];
+  return heavyMethods.includes(method) 
+    ? RPC_CONFIG.timeout.heavy 
+    : RPC_CONFIG.timeout.default;
+}
+
+/**
+ * Cache result with smart TTL based on data characteristics
+ * 
+ * @param {string} cacheKey - Cache key
+ * @param {any} result - Data to cache
+ * @param {string} method - RPC method (for TTL determination)
+ */
+function cacheResultWithSmartTTL(cacheKey, result, method) {
+  let ttl = CACHE_CONFIG.default;
+  
+  // Immutable data gets longer cache time
+  if (method === 'getblock' || method === 'getblockhash') {
+    ttl = CACHE_CONFIG.blocks;
+  }
+  // Expensive operations get longer cache time
+  else if (method === 'gettxoutsetinfo') {
+    ttl = CACHE_CONFIG.heavy;
+  }
+  
+  rpcCache.set(cacheKey, result, ttl);
+}
+
+/**
+ * Attempt to recover from errors using stale cached data
+ * 
+ * @param {string} method - RPC method
+ * @param {Array} params - Method parameters
+ * @returns {any|null} Stale cached data or null
+ */
+function attemptStaleDataRecovery(method, params) {
+  const cacheKey = generateCacheKey(method, params);
+  const staleResult = rpcCache.get(cacheKey, true); // Get even if expired
+  
+  if (staleResult !== undefined) {
+    console.log(`Returning stale cached result for ${method} due to error`);
+    return staleResult;
+  }
+  
+  return null;
+}
+
+/**
+ * Generate estimated UTXO set data when real data is unavailable
+ * 
+ * @returns {object} Estimated UTXO set structure
+ */
+function generateEstimatedUTXOData() {
+  console.log('Returning estimated UTXO set info');
+  return {
+    height: 0,
+    bestblock: "",
+    transactions: 0,
+    txouts: 0,
+    bogosize: 0,
+    hash_serialized_2: "",
+    disk_size: 0,
+    total_amount: 0,
+    _estimated: true // Flag indicating this is estimated data
+  };
+}
+
+// ============================================================================
+// ALGORITHM UTILITIES
+// ============================================================================
+
+/**
+ * Convert DigiByte algorithm identifiers to human-readable names
+ * 
+ * @param {string} algo - Algorithm identifier from block data
+ * @returns {string} Human-readable algorithm name
+ */
+function getAlgoName(algo) {
+  const algorithms = {
+    'sha256d': 'SHA256D',
+    'scrypt': 'Scrypt', 
+    'skein': 'Skein',
+    'qubit': 'Qubit',
+    'odo': 'Odo'
+  };
+  
+  return algorithms[algo] || 'Unknown';
+}
+
+// ============================================================================
+// ADVANCED BLOCK FETCHING
+// ============================================================================
+
+/**
+ * Enhanced block fetching with intelligent batching and caching
+ * 
+ * Features:
+ * - Time-range filtering for historical analysis
+ * - Intelligent batching to reduce RPC load
+ * - Duplicate prevention and height tracking
+ * - Mining pool identification from coinbase data
+ * - Taproot signaling detection
+ * 
+ * @param {number} startTimestamp - Unix timestamp for earliest blocks (0 for all)
+ * @param {number} endBlockHeight - Latest block height to fetch from
+ * @param {number} maxBlocks - Maximum number of blocks to return
+ * @returns {Promise<Array>} Array of processed block objects
+ */
 async function getBlocksByTimeRange(startTimestamp, endBlockHeight, maxBlocks = 240) {
-  // Create cache key for the entire result
+  // Create cache key for the entire result set
   const cacheKey = `blocks:range:${startTimestamp}:${endBlockHeight}:${maxBlocks}`;
   
   // Check cache first
@@ -186,180 +331,248 @@ async function getBlocksByTimeRange(startTimestamp, endBlockHeight, maxBlocks = 
     return cachedBlocks;
   }
   
-  console.log(`Fetching blocks from ${endBlockHeight} (past ${startTimestamp})`);
+  console.log(`Fetching blocks from height ${endBlockHeight} (after timestamp ${startTimestamp})`);
   
-  // Process in batches to avoid overwhelming RPC server
   const blocks = [];
-  const batchSize = 20;
   let currentHeight = endBlockHeight;
-  let attemptsRemaining = Math.min(1000, maxBlocks * 2); // Increase max attempts
-  let blocksToFetch = maxBlocks;
+  let attemptsRemaining = Math.min(1000, maxBlocks * 2);
   
-  // Track heights we've already processed to avoid duplicates
+  // Track processed heights to prevent duplicates
   const processedHeights = new Set();
   
   while (blocks.length < maxBlocks && attemptsRemaining > 0 && currentHeight > 0) {
     try {
-      // Fetch batch of block hashes
-      const batchHashes = [];
-      for (let i = 0; i < Math.min(batchSize, blocksToFetch); i++) {
-        if (currentHeight <= 0) break;
-        
-        // Skip heights we've already processed
-        if (processedHeights.has(currentHeight)) {
-          currentHeight--;
-          i--; // Don't count this as part of the batch
-          continue;
-        }
-        
-        processedHeights.add(currentHeight); // Mark as processed
-        const hash = await sendRpcRequest('getblockhash', [currentHeight--]);
-        if (hash) {
-          batchHashes.push(hash);
-        }
-        attemptsRemaining--;
-      }
+      // Fetch blocks in batches for efficiency
+      const batchHashes = await fetchBlockHashesBatch(
+        currentHeight, 
+        Math.min(RATE_LIMIT.batchSize, maxBlocks - blocks.length),
+        processedHeights
+      );
       
-      // Now fetch block data for each hash
+      // Update current height for next iteration
+      currentHeight -= batchHashes.length;
+      
+      // Process each block in the batch
       for (const hash of batchHashes) {
-        const block = await sendRpcRequest('getblock', [hash, 2]);
+        const processedBlock = await processBlockForStats(hash);
         
-        if (!block) continue;
+        if (!processedBlock) continue;
         
-        // Check if block is older than startTimestamp
-        if (block.time < startTimestamp && startTimestamp > 0) {
+        // Apply time filter if specified
+        if (startTimestamp > 0 && processedBlock.timestamp < startTimestamp) {
           break;
         }
         
-        // Process block
-        let minedTo = '';
-        let poolIdentifier = 'Unknown';
-
-        if (block.tx && block.tx.length > 0) {
-          const coinbaseTx = block.tx[0];
-          
-          // First try to find any output with an address
-          const firstOutputWithAddress = coinbaseTx.vout?.find(
-            output => output?.scriptPubKey?.address
-          );
-          
-          if (firstOutputWithAddress) {
-            minedTo = firstOutputWithAddress.scriptPubKey.address;
-          } else if (coinbaseTx.vout && coinbaseTx.vout.length > 1 && 
-                   coinbaseTx.vout[1].scriptPubKey && 
-                   coinbaseTx.vout[1].scriptPubKey.address) {
-            minedTo = coinbaseTx.vout[1].scriptPubKey.address;
-          }
-
-          // Process coinbase transaction
-          const coinbaseHex = coinbaseTx.vin[0].coinbase;
-          try {
-            const decodedCoinbase = Buffer.from(coinbaseHex, 'hex').toString('utf8', 0, 100);
-            
-            // Try multiple regex patterns
-            const patterns = [
-              /\/(.*?)\//,             // /PoolName/
-              /\[(.*?)\]/,             // [PoolName]
-              /@(.*?)@/,               // @PoolName@
-              /pool\.(.*?)\.com/i,     // pool.Name.com
-              /(.*?)pool/i,            // Namepool
-            ];
-            
-            for (const regex of patterns) {
-              const match = decodedCoinbase.match(regex);
-              if (match && match[1] && match[1].length > 2) {
-                poolIdentifier = match[1].trim();
-                break;
-              }
-            }
-          } catch (e) {
-            // Ignore coinbase parsing errors
-          }
-        }
-        
-        // Check for taproot signaling
-        const taprootSignaling = (block.version & (1 << 2)) !== 0;
-        
-        blocks.push({
-          height: block.height,
-          hash: block.hash,
-          algo: getAlgoName(block.pow_algo),
-          txCount: block.nTx,
-          difficulty: block.difficulty,
-          timestamp: block.time,
-          minedTo,
-          minerAddress: minedTo,
-          poolIdentifier,
-          taprootSignaling,
-          version: block.version
-        });
-        
-        blocksToFetch--;
+        blocks.push(processedBlock);
         
         if (blocks.length >= maxBlocks) {
-          console.log(`Reached target of ${maxBlocks} blocks, stopping fetch`);
+          console.log(`Reached target of ${maxBlocks} blocks`);
           break;
         }
       }
       
-      // Add small pause between batches
+      // Rate limiting pause between batches
       if (blocks.length < maxBlocks && currentHeight > 0) {
-        await new Promise(r => setTimeout(r, 200));
+        await new Promise(resolve => setTimeout(resolve, RATE_LIMIT.batchDelay));
       }
       
+      attemptsRemaining -= batchHashes.length;
+      
     } catch (error) {
-      console.error('Error while fetching blocks:', error);
-      await new Promise(r => setTimeout(r, 500));
+      console.error('Error in block batch processing:', error);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      attemptsRemaining--;
     }
   }
   
-  console.log(`Completed block fetching: got ${blocks.length}/${maxBlocks} blocks after ${attemptsRemaining} attempts`);
+  console.log(`Block fetching complete: ${blocks.length}/${maxBlocks} blocks processed`);
   
-  // Sort blocks by height (descending)
+  // Sort by height (descending) and cache result
   blocks.sort((a, b) => b.height - a.height);
   
-  // Cache result for 5 minutes
   if (blocks.length > 0) {
-    rpcCache.set(cacheKey, blocks, 300);
-    console.log(`Cached ${blocks.length} blocks from heights ${blocks[0].height} to ${blocks[blocks.length-1].height}`);
+    rpcCache.set(cacheKey, blocks, 300); // Cache for 5 minutes
+    console.log(`Cached ${blocks.length} blocks (heights ${blocks[0].height} to ${blocks[blocks.length-1].height})`);
   }
   
   return blocks;
 }
 
-// Preload essential data at startup
+/**
+ * Fetch a batch of block hashes efficiently
+ * 
+ * @param {number} startHeight - Starting block height
+ * @param {number} batchSize - Number of hashes to fetch
+ * @param {Set} processedHeights - Set of already processed heights
+ * @returns {Promise<Array>} Array of block hashes
+ */
+async function fetchBlockHashesBatch(startHeight, batchSize, processedHeights) {
+  const hashes = [];
+  let currentHeight = startHeight;
+  
+  for (let i = 0; i < batchSize && currentHeight > 0; i++) {
+    // Skip already processed heights
+    if (processedHeights.has(currentHeight)) {
+      currentHeight--;
+      i--; // Don't count this as part of the batch
+      continue;
+    }
+    
+    processedHeights.add(currentHeight);
+    
+    try {
+      const hash = await sendRpcRequest('getblockhash', [currentHeight]);
+      if (hash) {
+        hashes.push(hash);
+      }
+    } catch (error) {
+      console.error(`Failed to fetch hash for height ${currentHeight}:`, error.message);
+    }
+    
+    currentHeight--;
+  }
+  
+  return hashes;
+}
+
+/**
+ * Process a single block into stats-friendly format
+ * 
+ * @param {string} blockHash - Block hash to process
+ * @returns {Promise<object|null>} Processed block object or null
+ */
+async function processBlockForStats(blockHash) {
+  try {
+    const block = await sendRpcRequest('getblock', [blockHash, 2]);
+    if (!block || !block.tx || block.tx.length === 0) {
+      return null;
+    }
+    
+    // Extract mining information from coinbase transaction
+    const miningInfo = extractMiningInfo(block.tx[0]);
+    
+    // Detect Taproot signaling (BIP 341)
+    const taprootSignaling = (block.version & (1 << 2)) !== 0;
+    
+    return {
+      height: block.height,
+      hash: block.hash,
+      algo: getAlgoName(block.pow_algo),
+      txCount: block.nTx,
+      difficulty: block.difficulty,
+      timestamp: block.time,
+      minedTo: miningInfo.address,
+      minerAddress: miningInfo.address,
+      poolIdentifier: miningInfo.poolId,
+      taprootSignaling: taprootSignaling,
+      version: block.version
+    };
+    
+  } catch (error) {
+    console.error(`Error processing block ${blockHash}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Extract mining information from coinbase transaction
+ * 
+ * @param {object} coinbaseTx - Coinbase transaction object
+ * @returns {object} Mining info with address and pool identifier
+ */
+function extractMiningInfo(coinbaseTx) {
+  let address = '';
+  let poolId = 'Unknown';
+  
+  // Find first output with an address (miner reward)
+  const addressOutput = coinbaseTx.vout?.find(output => output?.scriptPubKey?.address);
+  if (addressOutput) {
+    address = addressOutput.scriptPubKey.address;
+  }
+  
+  // Extract pool identifier from coinbase data
+  if (coinbaseTx.vin?.[0]?.coinbase) {
+    poolId = extractPoolIdentifier(coinbaseTx.vin[0].coinbase);
+  }
+  
+  return { address, poolId };
+}
+
+/**
+ * Extract pool identifier from coinbase hex data
+ * 
+ * @param {string} coinbaseHex - Hex-encoded coinbase data
+ * @returns {string} Pool identifier or 'Unknown'
+ */
+function extractPoolIdentifier(coinbaseHex) {
+  try {
+    const decodedText = Buffer.from(coinbaseHex, 'hex').toString('utf8', 0, 100);
+    
+    // Common pool identifier patterns
+    const patterns = [
+      /\/(.*?)\//,                    // /PoolName/
+      /\[(.*?)\]/,                    // [PoolName]
+      /@(.*?)@/,                      // @PoolName@
+      /pool\.(.*?)\.com/i,            // pool.Name.com
+      /(.*?)pool/i,                   // Namepool
+    ];
+    
+    for (const pattern of patterns) {
+      const match = decodedText.match(pattern);
+      if (match && match[1] && match[1].length > 2) {
+        return match[1].trim();
+      }
+    }
+    
+    return 'Unknown';
+  } catch (error) {
+    return 'Unknown';
+  }
+}
+
+// ============================================================================
+// INITIALIZATION AND PRELOADING
+// ============================================================================
+
+/**
+ * Preload essential blockchain data at startup
+ * 
+ * This function ensures critical data is cached before the server
+ * starts serving requests, improving initial response times.
+ * 
+ * @returns {Promise<object>} Preload results with success status
+ */
 async function preloadEssentialData() {
   console.log('Preloading essential blockchain data...');
   
   try {
-    // 1. Get blockchain info
-    console.log('Loading blockchain info');
+    // Load core blockchain information
+    console.log('-> Loading blockchain info');
     const blockchainInfo = await sendRpcRequest('getblockchaininfo', [], true);
     if (!blockchainInfo) throw new Error('Failed to load blockchain info');
     
-    // 2. Get transaction stats
-    console.log('Loading chain transaction stats');
+    // Load transaction statistics  
+    console.log('-> Loading chain transaction stats');
     const chainTxStats = await sendRpcRequest('getchaintxstats', [], true);
     
-    // 3. Get tx outset info (this is expensive)
-    console.log('Loading transaction outset info (this may take a while)');
+    // Load UTXO set info (expensive operation)
+    console.log('-> Loading transaction outset info (may take time)');
     const txOutsetInfo = await sendRpcRequest('gettxoutsetinfo', [], true);
     
-    // 4. Get block reward
-    console.log('Loading block reward info');
+    // Load current block reward
+    console.log('-> Loading block reward info');
     const blockReward = await sendRpcRequest('getblockreward', [], true);
     
-    // 5. Get latest blocks
-    console.log('Loading recent blocks');
-    const latestBlockHeight = blockchainInfo.blocks;
-    // Use 0 for startTimestamp to ignore time filter and just get the most recent blocks
-    const blocks = await getBlocksByTimeRange(0, latestBlockHeight, 240);
+    // Load recent blocks for immediate display
+    console.log('-> Loading recent blocks');
+    const latestHeight = blockchainInfo.blocks;
+    const blocks = await getBlocksByTimeRange(0, latestHeight, 240);
     
     console.log('Essential data preloading complete!');
-    console.log(`- Blockchain height: ${blockchainInfo.blocks}`);
-    console.log(`- Loaded ${blocks.length} recent blocks`);
-    console.log(`- Transaction outset: ${txOutsetInfo ? 'Success' : 'Failed'}`);
-    console.log(`- Block reward: ${blockReward || 'Unknown'}`);
+    console.log(`-> Blockchain height: ${blockchainInfo.blocks}`);
+    console.log(`-> Loaded blocks: ${blocks.length}`);
+    console.log(`-> UTXO set: ${txOutsetInfo ? 'Success' : 'Failed'}`);
+    console.log(`-> Block reward: ${blockReward || 'Unknown'}`);
     
     return {
       blockchainInfo,
@@ -370,37 +583,81 @@ async function preloadEssentialData() {
       success: true
     };
   } catch (error) {
-    console.error('Error during preloading essential data:', error);
+    console.error('Error during essential data preloading:', error);
     return { success: false, error: error.message };
   }
 }
 
-// Add new helper function to improve block fetching performance
+// ============================================================================
+// PERFORMANCE UTILITIES
+// ============================================================================
+
+/**
+ * Batch block fetching for improved performance
+ * 
+ * @param {Array<string>} hashes - Array of block hashes
+ * @returns {Promise<Array>} Array of block objects
+ */
 async function fetchBlocksInBatch(hashes) {
   const results = [];
-  const batchSize = 5; // Process in smaller batches to avoid overwhelming the RPC server
+  const batchSize = 5; // Conservative batch size
   
   for (let i = 0; i < hashes.length; i += batchSize) {
     const batch = hashes.slice(i, i + batchSize);
     
-    // Create batch of promises to fetch in parallel
+    // Process batch in parallel
     const batchPromises = batch.map(hash => 
       sendRpcRequest('getblock', [hash, 2])
     );
     
-    // Wait for all promises in this mini-batch
     const batchResults = await Promise.all(batchPromises);
     results.push(...batchResults);
     
-    // Add small delay between batches
+    // Rate limiting between batches
     if (i + batchSize < hashes.length) {
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
   }
   
   return results;
 }
 
+/**
+ * Get comprehensive cache statistics
+ * 
+ * @returns {object} Cache performance metrics
+ */
+function getCacheStats() {
+  const hitRate = stats.totalRequests > 0 
+    ? (stats.cacheHits / stats.totalRequests * 100).toFixed(1) + '%' 
+    : '0%';
+    
+  return {
+    keys: rpcCache.keys().length,
+    hits: stats.cacheHits,
+    misses: stats.cacheMisses,
+    total: stats.totalRequests,
+    hitRate: hitRate,
+    pendingRequests: stats.pendingRequests
+  };
+}
+
+/**
+ * Reset cache statistics (useful for monitoring)
+ */
+function resetCacheStats() {
+  stats.totalRequests = 0;
+  stats.cacheHits = 0;
+  stats.cacheMisses = 0;
+}
+
+// ============================================================================
+// EXPRESS ROUTER SETUP
+// ============================================================================
+
+const router = express.Router();
+
+// Basic blockchain information
 router.get('/getblockchaininfo', async (req, res) => {
   try {
     const data = await sendRpcRequest('getblockchaininfo');
@@ -411,28 +668,33 @@ router.get('/getblockchaininfo', async (req, res) => {
   }
 });
 
+// Peer information with geolocation data
 router.get('/getpeerinfo', async (req, res) => {
   try {
-    const data = await sendRpcRequest('getpeerinfo');
-    const nodesWithGeoData = data.map((node) => {
+    const peerData = await sendRpcRequest('getpeerinfo');
+    
+    // Enhance peer data with geolocation
+    const enhancedPeers = peerData.map((node) => {
       const ip = node.addr.split(':')[0];
-      const geo = geoip.lookup(ip) || {};
-      const newNode = {
+      const geoData = geoip.lookup(ip) || {};
+      
+      return {
         ...node,
-        lat: geo.ll && geo.ll[0],
-        lon: geo.ll && geo.ll[1],
-        city: geo.city,
-        country: geo.country,
+        lat: geoData.ll && geoData.ll[0],
+        lon: geoData.ll && geoData.ll[1],
+        city: geoData.city,
+        country: geoData.country,
       };
-      return newNode;
     });
-    res.json(nodesWithGeoData);
+    
+    res.json(enhancedPeers);
   } catch (error) {
     console.error('Error in /api/getpeerinfo:', error);
     res.status(500).json({ error: 'Error fetching peer info' });
   }
 });
 
+// Current block reward
 router.get('/getblockreward', async (req, res) => {
   try {
     const data = await sendRpcRequest('getblockreward');
@@ -443,30 +705,36 @@ router.get('/getblockreward', async (req, res) => {
   }
 });
 
+// Latest block information
 router.get('/getlatestblock', async (req, res) => {
   try {
     const latestBlockHash = await sendRpcRequest('getbestblockhash');
     if (!latestBlockHash) {
       throw new Error('Failed to fetch latest block hash');
     }
+    
     const block = await sendRpcRequest('getblock', [latestBlockHash]);
     if (!block) {
       throw new Error('Failed to fetch block data');
     }
-    const latestBlockInfo = {
+    
+    res.json({
       height: block.height,
       hash: block.hash,
       algo: block.pow_algo,
       txCount: block.nTx,
       difficulty: block.difficulty,
-    };
-    res.json(latestBlockInfo);
+    });
   } catch (error) {
     console.error('Error fetching latest block:', error);
-    res.status(500).json({ error: 'Error fetching latest block', details: error.message, stack: error.stack });
+    res.status(500).json({ 
+      error: 'Error fetching latest block', 
+      details: error.message 
+    });
   }
 });
 
+// Chain transaction statistics
 router.get('/getchaintxstats', async (req, res) => {
   try {
     const data = await sendRpcRequest('getchaintxstats');
@@ -477,6 +745,7 @@ router.get('/getchaintxstats', async (req, res) => {
   }
 });
 
+// UTXO set information
 router.get('/gettxoutsetinfo', async (req, res) => {
   try {
     const data = await sendRpcRequest('gettxoutsetinfo');
@@ -487,13 +756,13 @@ router.get('/gettxoutsetinfo', async (req, res) => {
   }
 });
 
-// Add stats endpoint to check cache status
+// Cache performance statistics
 router.get('/rpccachestats', (req, res) => {
   const stats = getCacheStats();
   res.json(stats);
 });
 
-// Add endpoint to manually refresh specific cache data
+// Manual cache refresh endpoint
 router.post('/refreshcache', async (req, res) => {
   try {
     const { type } = req.body || {};
@@ -504,6 +773,7 @@ router.post('/refreshcache', async (req, res) => {
     
     let result;
     
+    // Refresh specific data types
     switch (type) {
       case 'blockchain':
         result = await sendRpcRequest('getblockchaininfo', [], true);
@@ -530,6 +800,10 @@ router.post('/refreshcache', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================================================
+// MODULE EXPORTS
+// ============================================================================
 
 module.exports = {
   router,
