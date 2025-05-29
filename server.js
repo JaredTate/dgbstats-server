@@ -37,6 +37,7 @@ const zmq = require('zeromq');
 const {
   router: rpcRoutes,
   sendRpcRequest,
+  getTransactionData,
   getAlgoName,
   getBlocksByTimeRange
 } = require('./rpc');
@@ -198,6 +199,9 @@ wss.on('connection', (ws) => {
   
   // Send geo-located peer data
   sendGeoDataToClient(ws);
+  
+  // Auto-send mempool data for TxsPage
+  sendMempoolDataToClient(ws);
 
   // Handle incoming messages from client
   ws.on('message', async (message) => {
@@ -303,20 +307,14 @@ async function sendMempoolDataToClient(ws) {
       '500+': 0
     };
     
-    // Limit to 100 transactions for performance
-    for (const txid of txIds.slice(0, 100)) {
+    // Limit to 50 transactions for performance to avoid overwhelming the frontend
+    for (const txid of txIds.slice(0, 50)) {
       const txData = rawMempool[txid];
       if (!txData) continue;
       
       try {
-        // Use gettransaction for better data (when available in wallet)
-        let enhancedTxData = null;
-        try {
-          enhancedTxData = await sendRpcRequest('gettransaction', [txid]);
-        } catch (e) {
-          // Fallback to getrawtransaction if gettransaction fails (tx not in wallet)
-          enhancedTxData = await sendRpcRequest('getrawtransaction', [txid, true]);
-        }
+        // Use the enhanced transaction data fetcher with proper fallback handling
+        const enhancedTxData = await getTransactionData(txid);
         
         // Calculate fee rate (satoshis per byte)
         const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
@@ -395,6 +393,11 @@ async function sendMempoolDataToClient(ws) {
         
       } catch (txError) {
         console.error(`Error processing transaction ${txid}:`, txError.message);
+        console.error(`This error may indicate:
+1. Transaction was removed from mempool during processing
+2. DigiByte node requires txindex=1 for confirmed transactions
+3. Network connectivity issues with RPC server`);
+        
         // Add basic transaction data even if enhanced data fails
         const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
         let priority = 'low';
@@ -1108,12 +1111,12 @@ async function sendRecentTransactionsToClient(ws) {
           if (!tx) continue;
           
           try {
-            // Try to use gettransaction for better data
-            let enhancedTxData = null;
-            try {
-              enhancedTxData = await sendRpcRequest('gettransaction', [tx.txid]);
-            } catch (e) {
-              // Transaction not in wallet, use the raw transaction data we already have
+            // Use the enhanced transaction data fetcher with proper fallback handling
+            let enhancedTxData = await getTransactionData(tx.txid, fullBlock.hash);
+            
+            // If getTransactionData returns null, use the raw transaction data we already have
+            if (!enhancedTxData) {
+              console.log(`Using raw transaction data for ${tx.txid} from block ${fullBlock.height}`);
               enhancedTxData = tx;
             }
             
@@ -1715,14 +1718,8 @@ async function handleRawTransactions() {
         .reverse()
         .toString('hex');
       
-      // Get full transaction details - try gettransaction first
-      let txData = null;
-      try {
-        txData = await sendRpcRequest('gettransaction', [txid]);
-      } catch (e) {
-        // Fallback to getrawtransaction if gettransaction fails
-        txData = await sendRpcRequest('getrawtransaction', [txid, true]);
-      }
+      // Get full transaction details using enhanced transaction fetcher
+      const txData = await getTransactionData(txid);
       
       if (txData) {
         // Calculate transaction value
@@ -1785,7 +1782,10 @@ async function handleHashTransactions() {
   for await (const [topic, message] of zmqSubHashTx) {
     try {
       const txid = message.toString('hex');
-      console.log(`New transaction hash: ${txid}`);
+      // Reduced logging to prevent spam
+      if (Math.random() < 0.1) { // Only log 10% of transactions
+        console.log(`New transaction hash: ${txid}`);
+      }
       
       // Optionally fetch full transaction details
       // This is more efficient than processing raw transactions

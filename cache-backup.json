@@ -2,21 +2,21 @@
   "initialData": {
     "blockchainInfo": {
       "chain": "main",
-      "blocks": 21471119,
-      "headers": 21471119,
-      "bestblockhash": "4f5ef9c516951e279dec10d956891d1bb59513b172bfdfc318ef2335e8472770",
-      "mediantime": 1748550482,
-      "verificationprogress": 0.9999999901655084,
+      "blocks": 21471265,
+      "headers": 21471265,
+      "bestblockhash": "000000000000000196820cbc8a3466578be8b3f754773cc7e3b25845ed409f54",
+      "mediantime": 1748552533,
+      "verificationprogress": 0.9999999459105069,
       "initialblockdownload": false,
-      "chainwork": "00000000000000000000000000000000000000000018ae97ee33a767e02325cc",
-      "size_on_disk": 33723339884,
+      "chainwork": "00000000000000000000000000000000000000000018aeaa727f5e445fb2024c",
+      "size_on_disk": 33723435141,
       "pruned": false,
       "difficulties": {
-        "sha256d": 922180444.2763487,
-        "scrypt": 454079.6534854235,
-        "skein": 10499478.13252609,
-        "qubit": 473921.0113120885,
-        "odo": 57468.41185522178
+        "sha256d": 901170464.602115,
+        "scrypt": 386528.3093534664,
+        "skein": 26269139.90108709,
+        "qubit": 1011612.064103107,
+        "odo": 152526.7891510842
       },
       "softforks": {
         "bip34": {
@@ -76,26 +76,26 @@
       "warnings": ""
     },
     "chainTxStats": {
-      "time": 1748550510,
-      "txcount": 50635357,
-      "window_final_block_hash": "4f5ef9c516951e279dec10d956891d1bb59513b172bfdfc318ef2335e8472770",
-      "window_final_block_height": 21471119,
+      "time": 1748552630,
+      "txcount": 50635552,
+      "window_final_block_hash": "000000000000000196820cbc8a3466578be8b3f754773cc7e3b25845ed409f54",
+      "window_final_block_height": 21471265,
       "window_block_count": 172800,
-      "window_tx_count": 280468,
-      "window_interval": 2582676,
-      "txrate": 0.1085958904639994
+      "window_tx_count": 280452,
+      "window_interval": 2582618,
+      "txrate": 0.1085921340283387
     },
     "txOutsetInfo": {
-      "height": 21471119,
-      "bestblock": "4f5ef9c516951e279dec10d956891d1bb59513b172bfdfc318ef2335e8472770",
-      "txouts": 14987739,
-      "bogosize": 1122787176,
-      "hash_serialized_2": "92fd8b8c0dd38acc0dd67a54d0b6144fdecc371fcb7f7ccb489a2cd20ca39633",
-      "total_amount": 17717102576.96361,
-      "transactions": 4080901,
+      "height": 21471264,
+      "bestblock": "59a2be1ff74f635d9119ef67ec82e8292600e339580e18066098d649a8a25533",
+      "txouts": 14988136,
+      "bogosize": 1122816560,
+      "hash_serialized_2": "04818f25518c16cf8a56ee4e6e48dbebb6b3110df80f229c62d52128b78454fb",
+      "total_amount": 17717146083.559906,
+      "transactions": 4081033,
       "disk_size": 801380394
     },
     "blockReward": 300.04549168
   },
-  "timestamp": 1748550590903
+  "timestamp": 1748552728165
 }

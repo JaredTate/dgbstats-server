@@ -27,9 +27,9 @@ const NodeCache = require('node-cache');
 
 // RPC Connection Settings
 const RPC_CONFIG = {
-  user: 'user',
-  password: 'password', 
-  url: 'http://127.0.0.1:14044',
+  user: process.env.DGB_RPC_USER || 'user',
+  password: process.env.DGB_RPC_PASSWORD || 'password', 
+  url: process.env.DGB_RPC_URL || 'http://127.0.0.1:14044',
   timeout: {
     default: 30000,      // 30 seconds for most commands
     heavy: 120000        // 2 minutes for expensive operations like gettxoutsetinfo
@@ -77,6 +77,62 @@ const stats = {
 // ============================================================================
 // CORE RPC FUNCTIONALITY
 // ============================================================================
+
+/**
+ * Enhanced transaction data fetcher that intelligently uses gettransaction vs getrawtransaction
+ * 
+ * This function handles the RPC error cases mentioned in the user's issue where gettransaction
+ * fails for transactions not in the wallet, and properly falls back to getrawtransaction
+ * with improved error logging.
+ * 
+ * @param {string} txid - Transaction ID to fetch
+ * @param {string} blockhash - Optional block hash for confirmed transactions
+ * @returns {Promise<object|null>} Transaction data or null if not found
+ */
+async function getTransactionData(txid, blockhash = null) {
+  // Don't log every attempt to reduce noise
+  
+  try {
+    // For mempool transactions, skip gettransaction since it only works for wallet transactions
+    // and go straight to getrawtransaction which works for all mempool transactions
+    const params = blockhash ? [txid, true, blockhash] : [txid, true];
+    const rawTxData = await sendRpcRequest('getrawtransaction', params);
+    
+    if (rawTxData) {
+      return {
+        ...rawTxData,
+        method: 'getrawtransaction',
+        enhanced: false
+      };
+    }
+  } catch (rawError) {
+    // Only try gettransaction as a fallback for wallet transactions (rarely needed)
+    try {
+      const txData = await sendRpcRequest('gettransaction', [txid]);
+      if (txData) {
+        return {
+          ...txData,
+          method: 'gettransaction',
+          enhanced: true
+        };
+      }
+    } catch (walletError) {
+      console.error(`Failed to fetch transaction ${txid}: ${rawError.message}`);
+      
+      // Check if it's a common error that requires txindex=1
+      if (rawError.message.includes('No such mempool or blockchain transaction')) {
+        console.error(`ERROR: Transaction ${txid} not found. This may require:
+1. DigiByte node with txindex=1 enabled
+2. Node reindex if txindex was recently enabled  
+3. Transaction may not exist or be very old`);
+      }
+      
+      return null;
+    }
+  }
+  
+  return null;
+}
 
 /**
  * Enhanced RPC request function with intelligent caching and rate limiting
@@ -831,6 +887,7 @@ router.post('/refreshcache', async (req, res) => {
 module.exports = {
   router,
   sendRpcRequest,
+  getTransactionData,
   getAlgoName,
   getBlocksByTimeRange,
   preloadEssentialData,
