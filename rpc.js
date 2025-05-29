@@ -756,6 +756,29 @@ router.get('/gettxoutsetinfo', async (req, res) => {
   }
 });
 
+// Mempool information endpoint
+router.get('/getmempoolinfo', async (req, res) => {
+  try {
+    const data = await sendRpcRequest('getmempoolinfo');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/getmempoolinfo:', error);
+    res.status(500).json({ error: 'Error fetching mempool info' });
+  }
+});
+
+// Raw mempool data endpoint
+router.get('/getrawmempool', async (req, res) => {
+  try {
+    // Get verbose mempool data with full transaction details
+    const data = await sendRpcRequest('getrawmempool', [true]);
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/getrawmempool:', error);
+    res.status(500).json({ error: 'Error fetching raw mempool' });
+  }
+});
+
 // Cache performance statistics
 router.get('/rpccachestats', (req, res) => {
   const stats = getCacheStats();

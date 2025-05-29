@@ -31,6 +31,7 @@ const path = require('path');
 const axios = require('axios');
 const fs = require('fs').promises;
 const crypto = require('crypto');
+const zmq = require('zeromq');
 
 // Import RPC functionality from dedicated module
 const {
@@ -53,6 +54,20 @@ const SERVER_CONFIG = {
   corsEnabled: true,
   maxRecentBlocks: 240,
   pingInterval: 30000  // 30 seconds WebSocket ping
+};
+
+// ============================================================================
+// ZEROMQ CONFIGURATION
+// ============================================================================
+
+const ZMQ_CONFIG = {
+  enabled: true,  // Set to false to disable ZeroMQ
+  endpoints: {
+    rawtx: 'tcp://127.0.0.1:28333',      // Raw transaction data
+    hashtx: 'tcp://127.0.0.1:28335',     // Transaction hashes
+    rawblock: 'tcp://127.0.0.1:28332',   // Raw block data
+    hashblock: 'tcp://127.0.0.1:28334'   // Block hashes
+  }
 };
 
 // ============================================================================
@@ -174,12 +189,29 @@ wss.on('connection', (ws) => {
     type: 'recentBlocks', 
     data: recentBlocks 
   }));
+  
+  // Send recent transactions from blocks
+  sendRecentTransactionsToClient(ws);
 
   // Send cached initial data
   sendInitialDataToClient(ws);
   
   // Send geo-located peer data
   sendGeoDataToClient(ws);
+
+  // Handle incoming messages from client
+  ws.on('message', async (message) => {
+    try {
+      const msg = JSON.parse(message);
+      
+      if (msg.type === 'requestMempool') {
+        console.log('Client requested mempool data');
+        await sendMempoolDataToClient(ws);
+      }
+    } catch (error) {
+      console.error('Error handling WebSocket message:', error);
+    }
+  });
 
   // Setup connection heartbeat
   const pingTimer = setInterval(() => {
@@ -243,6 +275,202 @@ function sendGeoDataToClient(ws) {
     ws.send(JSON.stringify({ 
       type: 'geoData', 
       data: uniqueNodes 
+    }));
+  }
+}
+
+/**
+ * Fetch and send mempool data to a specific client
+ * @param {WebSocket} ws - WebSocket connection
+ */
+async function sendMempoolDataToClient(ws) {
+  try {
+    // Get mempool statistics
+    const mempoolInfo = await sendRpcRequest('getmempoolinfo');
+    
+    // Get raw mempool transactions (verbose mode)
+    const rawMempool = await sendRpcRequest('getrawmempool', [true]);
+    
+    // Process transactions
+    const transactions = [];
+    const txIds = Object.keys(rawMempool || {});
+    let totalFee = 0;
+    const feeDistribution = {
+      '0-10': 0,
+      '10-50': 0,
+      '50-100': 0,
+      '100-500': 0,
+      '500+': 0
+    };
+    
+    // Limit to 100 transactions for performance
+    for (const txid of txIds.slice(0, 100)) {
+      const txData = rawMempool[txid];
+      if (!txData) continue;
+      
+      try {
+        // Use gettransaction for better data (when available in wallet)
+        let enhancedTxData = null;
+        try {
+          enhancedTxData = await sendRpcRequest('gettransaction', [txid]);
+        } catch (e) {
+          // Fallback to getrawtransaction if gettransaction fails (tx not in wallet)
+          enhancedTxData = await sendRpcRequest('getrawtransaction', [txid, true]);
+        }
+        
+        // Calculate fee rate (satoshis per byte)
+        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+        
+        // Update fee distribution
+        if (feeRate < 10) feeDistribution['0-10']++;
+        else if (feeRate < 50) feeDistribution['10-50']++;
+        else if (feeRate < 100) feeDistribution['50-100']++;
+        else if (feeRate < 500) feeDistribution['100-500']++;
+        else feeDistribution['500+']++;
+        
+        // Determine priority based on fee rate
+        let priority = 'low';
+        if (feeRate > 100) priority = 'high';
+        else if (feeRate > 50) priority = 'medium';
+        
+        // Calculate transaction value
+        let totalValue = 0;
+        let inputs = [];
+        let outputs = [];
+        
+        if (enhancedTxData) {
+          // For gettransaction response
+          if (enhancedTxData.details && Array.isArray(enhancedTxData.details)) {
+            totalValue = enhancedTxData.amount || 0;
+            outputs = enhancedTxData.details.map(detail => ({
+              address: detail.address || '',
+              amount: detail.amount || 0,
+              category: detail.category || ''
+            }));
+          }
+          // For getrawtransaction response
+          else if (enhancedTxData.vout && Array.isArray(enhancedTxData.vout)) {
+            for (const output of enhancedTxData.vout) {
+              if (output.value) {
+                totalValue += output.value;
+                outputs.push({
+                  address: output.scriptPubKey?.address || '',
+                  amount: output.value,
+                  type: output.scriptPubKey?.type || ''
+                });
+              }
+            }
+            
+            // Process inputs if available
+            if (enhancedTxData.vin && Array.isArray(enhancedTxData.vin)) {
+              inputs = enhancedTxData.vin.map(input => ({
+                txid: input.txid || '',
+                vout: input.vout || 0,
+                address: '', // Would need previous tx data
+                amount: 0    // Would need previous tx data
+              }));
+            }
+          }
+        }
+        
+        totalFee += txData.fee || 0;
+        
+        transactions.push({
+          txid: txid,
+          size: txData.vsize || txData.size || 0,
+          vsize: txData.vsize || txData.size || 0,
+          fee: txData.fee || 0,
+          value: Math.abs(totalValue), // Use absolute value
+          time: txData.time || Math.floor(Date.now() / 1000),
+          inputs: inputs,
+          outputs: outputs,
+          fee_rate: feeRate,
+          priority: priority,
+          confirmations: 0,
+          descendantcount: txData.descendantcount || 0,
+          descendantsize: txData.descendantsize || 0,
+          ancestorcount: txData.ancestorcount || 0,
+          ancestorsize: txData.ancestorsize || 0
+        });
+        
+      } catch (txError) {
+        console.error(`Error processing transaction ${txid}:`, txError.message);
+        // Add basic transaction data even if enhanced data fails
+        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+        let priority = 'low';
+        if (feeRate > 100) priority = 'high';
+        else if (feeRate > 50) priority = 'medium';
+        
+        transactions.push({
+          txid: txid,
+          size: txData.vsize || txData.size || 0,
+          vsize: txData.vsize || txData.size || 0,
+          fee: txData.fee || 0,
+          value: 0,
+          time: txData.time || Math.floor(Date.now() / 1000),
+          inputs: [],
+          outputs: [],
+          fee_rate: feeRate,
+          priority: priority,
+          confirmations: 0,
+          descendantcount: txData.descendantcount || 0,
+          descendantsize: txData.descendantsize || 0,
+          ancestorcount: txData.ancestorcount || 0,
+          ancestorsize: txData.ancestorsize || 0
+        });
+      }
+    }
+    
+    // Sort by time descending (newest first)
+    transactions.sort((a, b) => b.time - a.time);
+    
+    // Calculate average fee
+    const avgFee = transactions.length > 0 
+      ? transactions.reduce((sum, tx) => sum + tx.fee, 0) / transactions.length
+      : 0;
+    
+    // Send enhanced data to client
+    ws.send(JSON.stringify({
+      type: 'mempool',
+      data: {
+        stats: {
+          size: mempoolInfo?.size || 0,
+          bytes: mempoolInfo?.bytes || 0,
+          usage: mempoolInfo?.usage || 0,
+          maxmempool: mempoolInfo?.maxmempool || 300000000,
+          minfee: mempoolInfo?.mempoolminfee || mempoolInfo?.minrelaytxfee || 0.00001,
+          avgfee: avgFee,
+          totalfee: totalFee,
+          feeDistribution: feeDistribution
+        },
+        transactions: transactions
+      }
+    }));
+    
+  } catch (error) {
+    console.error('Error fetching mempool data:', error);
+    // Send empty data on error
+    ws.send(JSON.stringify({
+      type: 'mempool',
+      data: {
+        stats: {
+          size: 0,
+          bytes: 0,
+          usage: 0,
+          maxmempool: 300000000,
+          minfee: 0,
+          avgfee: 0,
+          totalfee: 0,
+          feeDistribution: {
+            '0-10': 0,
+            '10-50': 0,
+            '50-100': 0,
+            '100-500': 0,
+            '500+': 0
+          }
+        },
+        transactions: []
+      }
     }));
   }
 }
@@ -853,6 +1081,270 @@ function broadcastGeoData(geoNodes) {
   });
 }
 
+/**
+ * Fetch and send recent transactions from blockchain to a specific client
+ * @param {WebSocket} ws - WebSocket connection
+ */
+async function sendRecentTransactionsToClient(ws) {
+  try {
+    console.log('Fetching recent blockchain transactions...');
+    
+    // Get transactions from the last few blocks
+    const transactions = [];
+    const blocksToCheck = Math.min(5, recentBlocks.length); // Check last 5 blocks
+    
+    for (let i = 0; i < blocksToCheck; i++) {
+      const block = recentBlocks[i];
+      if (!block || !block.hash) continue;
+      
+      try {
+        // Get full block data with transactions
+        const fullBlock = await sendRpcRequest('getblock', [block.hash, 2]);
+        if (!fullBlock || !fullBlock.tx) continue;
+        
+        // Process each transaction in the block (skip coinbase)
+        for (let j = 1; j < Math.min(fullBlock.tx.length, 20); j++) { // Limit to 20 txs per block
+          const tx = fullBlock.tx[j];
+          if (!tx) continue;
+          
+          try {
+            // Try to use gettransaction for better data
+            let enhancedTxData = null;
+            try {
+              enhancedTxData = await sendRpcRequest('gettransaction', [tx.txid]);
+            } catch (e) {
+              // Transaction not in wallet, use the raw transaction data we already have
+              enhancedTxData = tx;
+            }
+            
+            // Calculate transaction value and process inputs/outputs
+            let totalValue = 0;
+            let inputs = [];
+            let outputs = [];
+            let actualFee = 0;
+            
+            if (enhancedTxData.details && Array.isArray(enhancedTxData.details)) {
+              // gettransaction response format
+              totalValue = Math.abs(enhancedTxData.amount || 0);
+              actualFee = enhancedTxData.fee ? Math.abs(enhancedTxData.fee) : 0;
+              
+              outputs = enhancedTxData.details.map(detail => ({
+                address: detail.address || '',
+                amount: detail.amount || 0,
+                category: detail.category || '',
+                vout: detail.vout || 0
+              }));
+            } else {
+              // Raw transaction format
+              if (tx.vout && Array.isArray(tx.vout)) {
+                for (const output of tx.vout) {
+                  if (output.value) {
+                    totalValue += output.value;
+                    outputs.push({
+                      address: output.scriptPubKey?.address || '',
+                      amount: output.value,
+                      type: output.scriptPubKey?.type || '',
+                      vout: output.n || 0
+                    });
+                  }
+                }
+              }
+              
+              // Process inputs
+              if (tx.vin && Array.isArray(tx.vin)) {
+                inputs = tx.vin.map(input => ({
+                  txid: input.txid || '',
+                  vout: input.vout || 0,
+                  address: '', // Would need previous tx data
+                  amount: 0    // Would need previous tx data
+                }));
+              }
+              
+              // Estimate fee for raw transactions
+              actualFee = 0.0001 * (tx.vin ? tx.vin.length : 1);
+            }
+            
+            // Calculate size and fee rate
+            const txSize = enhancedTxData.vsize || enhancedTxData.size || tx.vsize || tx.size || 0;
+            const feeRate = txSize > 0 && actualFee > 0 ? Math.round((actualFee * 100000000) / txSize) : 0;
+            
+            // Determine priority based on fee rate
+            let priority = 'low';
+            if (feeRate > 100) priority = 'high';
+            else if (feeRate > 50) priority = 'medium';
+            
+            transactions.push({
+              txid: tx.txid || tx.hash,
+              blockHeight: fullBlock.height,
+              blockHash: fullBlock.hash,
+              blocktime: fullBlock.time,
+              time: enhancedTxData.time || tx.time || fullBlock.time,
+              timereceived: enhancedTxData.timereceived || fullBlock.time,
+              value: totalValue,
+              size: txSize,
+              vsize: enhancedTxData.vsize || tx.vsize || txSize,
+              fee: actualFee,
+              feeRate: feeRate,
+              priority: priority,
+              inputs: inputs,
+              outputs: outputs,
+              confirmations: block.height ? (recentBlocks[0].height - block.height + 1) : 1,
+              generated: enhancedTxData.generated || false,
+              replaceable: enhancedTxData['bip125-replaceable'] || 'no'
+            });
+            
+          } catch (txError) {
+            console.error(`Error processing transaction ${tx.txid}:`, txError.message);
+            
+            // Add basic transaction data even if enhanced processing fails
+            let totalValue = 0;
+            if (tx.vout && Array.isArray(tx.vout)) {
+              for (const output of tx.vout) {
+                if (output.value) {
+                  totalValue += output.value;
+                }
+              }
+            }
+            
+            const txSize = tx.vsize || tx.size || 0;
+            const estimatedFee = 0.0001 * (tx.vin ? tx.vin.length : 1);
+            
+            transactions.push({
+              txid: tx.txid || tx.hash,
+              blockHeight: fullBlock.height,
+              blockHash: fullBlock.hash,
+              blocktime: fullBlock.time,
+              time: tx.time || fullBlock.time,
+              timereceived: fullBlock.time,
+              value: totalValue,
+              size: txSize,
+              vsize: txSize,
+              fee: estimatedFee,
+              feeRate: txSize > 0 ? Math.round((estimatedFee * 100000000) / txSize) : 0,
+              priority: 'low',
+              inputs: tx.vin ? tx.vin.length : 0,
+              outputs: tx.vout ? tx.vout.length : 0,
+              confirmations: block.height ? (recentBlocks[0].height - block.height + 1) : 1,
+              generated: false,
+              replaceable: 'no'
+            });
+          }
+        }
+        
+      } catch (blockError) {
+        console.error(`Error processing block ${block.hash}:`, blockError.message);
+      }
+    }
+    
+    // Sort by most recent first
+    transactions.sort((a, b) => b.time - a.time);
+    
+    // Send to client
+    ws.send(JSON.stringify({
+      type: 'recentTransactions',
+      data: transactions.slice(0, 50) // Limit to 50 most recent
+    }));
+    
+    console.log(`Sent ${transactions.length} recent transactions to client`);
+    
+  } catch (error) {
+    console.error('Error fetching recent transactions:', error);
+    // Send empty array on error
+    ws.send(JSON.stringify({
+      type: 'recentTransactions',
+      data: []
+    }));
+  }
+}
+
+/**
+ * Monitor mempool for changes and broadcast updates
+ * This function is optional and can be enabled by uncommenting
+ * the setInterval call in the startup sequence
+ */
+async function monitorMempoolChanges() {
+  try {
+    // Get current mempool transaction IDs
+    const currentMempool = await sendRpcRequest('getrawmempool', [false]);
+    if (!currentMempool || !Array.isArray(currentMempool)) return;
+    
+    // Initialize tracking set if not exists
+    if (!global.knownMempoolTxs) {
+      global.knownMempoolTxs = new Set(currentMempool);
+      return;
+    }
+    
+    // Check for new transactions
+    const newTxIds = currentMempool.filter(txid => !global.knownMempoolTxs.has(txid));
+    
+    if (newTxIds.length > 0) {
+      // Get details for new transactions (limit to prevent overload)
+      const rawMempool = await sendRpcRequest('getrawmempool', [true]);
+      
+      for (const txid of newTxIds.slice(0, 10)) {
+        if (rawMempool[txid]) {
+          const txData = rawMempool[txid];
+          const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+          
+          const newTx = {
+            txid: txid,
+            size: txData.vsize || txData.size || 0,
+            fee: txData.fee || 0,
+            time: txData.time || Math.floor(Date.now() / 1000),
+            inputs: txData.depends ? txData.depends.length : 1,
+            outputs: 2,
+            fee_rate: feeRate,
+            priority: feeRate > 100 ? 'high' : feeRate > 50 ? 'medium' : 'low'
+          };
+          
+          // Broadcast to all clients
+          const message = JSON.stringify({
+            type: 'newTransaction',
+            data: newTx
+          });
+          
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(message);
+              } catch (error) {
+                console.error('Error broadcasting new transaction:', error);
+              }
+            }
+          });
+          
+          global.knownMempoolTxs.add(txid);
+        }
+      }
+    }
+    
+    // Check for removed transactions (confirmed in blocks)
+    const removedTxIds = Array.from(global.knownMempoolTxs).filter(txid => !currentMempool.includes(txid));
+    
+    for (const txid of removedTxIds) {
+      const message = JSON.stringify({
+        type: 'removedTransaction',
+        data: { txid }
+      });
+      
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(message);
+          } catch (error) {
+            console.error('Error broadcasting removed transaction:', error);
+          }
+        }
+      });
+      
+      global.knownMempoolTxs.delete(txid);
+    }
+    
+  } catch (error) {
+    console.error('Error monitoring mempool:', error);
+  }
+}
+
 // ============================================================================
 // VISIT TRACKING AND ANALYTICS
 // ============================================================================
@@ -1137,6 +1629,305 @@ async function refreshPeerData() {
 }
 
 // ============================================================================
+// ZEROMQ TRANSACTION MONITORING
+// ============================================================================
+
+/**
+ * ZeroMQ subscribers for real-time blockchain events
+ */
+let zmqSubRawTx = null;
+let zmqSubHashTx = null;
+let zmqSubRawBlock = null;
+let zmqSubHashBlock = null;
+
+/**
+ * Initialize ZeroMQ subscribers for real-time transaction monitoring
+ * Connects to DigiByte node's ZMQ endpoints if enabled in config
+ */
+async function initializeZeroMQ() {
+  if (!ZMQ_CONFIG.enabled) {
+    console.log('ZeroMQ disabled in configuration');
+    return;
+  }
+
+  try {
+    console.log('Initializing ZeroMQ subscribers...');
+
+    // Subscribe to raw transactions
+    if (ZMQ_CONFIG.endpoints.rawtx) {
+      zmqSubRawTx = new zmq.Subscriber;
+      zmqSubRawTx.connect(ZMQ_CONFIG.endpoints.rawtx);
+      zmqSubRawTx.subscribe('rawtx');
+      
+      console.log(`✓ Connected to rawtx endpoint: ${ZMQ_CONFIG.endpoints.rawtx}`);
+      
+      // Handle raw transaction data
+      handleRawTransactions();
+    }
+
+    // Subscribe to transaction hashes
+    if (ZMQ_CONFIG.endpoints.hashtx) {
+      zmqSubHashTx = new zmq.Subscriber;
+      zmqSubHashTx.connect(ZMQ_CONFIG.endpoints.hashtx);
+      zmqSubHashTx.subscribe('hashtx');
+      
+      console.log(`✓ Connected to hashtx endpoint: ${ZMQ_CONFIG.endpoints.hashtx}`);
+      
+      // Handle transaction hashes
+      handleHashTransactions();
+    }
+
+    // Subscribe to raw blocks (for confirmed transactions)
+    if (ZMQ_CONFIG.endpoints.rawblock) {
+      zmqSubRawBlock = new zmq.Subscriber;
+      zmqSubRawBlock.connect(ZMQ_CONFIG.endpoints.rawblock);
+      zmqSubRawBlock.subscribe('rawblock');
+      
+      console.log(`✓ Connected to rawblock endpoint: ${ZMQ_CONFIG.endpoints.rawblock}`);
+      
+      // Handle raw block data
+      handleRawBlocks();
+    }
+
+    console.log('ZeroMQ initialization complete');
+    
+  } catch (error) {
+    console.error('Failed to initialize ZeroMQ:', error);
+    console.log('Falling back to mempool polling mode');
+  }
+}
+
+/**
+ * Handle incoming raw transaction data from ZeroMQ
+ * Processes and broadcasts new transactions to WebSocket clients
+ */
+async function handleRawTransactions() {
+  for await (const [topic, message] of zmqSubRawTx) {
+    try {
+      // Parse the raw transaction
+      const txHex = message.toString('hex');
+      
+      // Get transaction details via RPC (since we have the hash)
+      // For now, we'll need to decode the raw transaction
+      const txid = crypto.createHash('sha256')
+        .update(crypto.createHash('sha256').update(message).digest())
+        .digest()
+        .reverse()
+        .toString('hex');
+      
+      // Get full transaction details - try gettransaction first
+      let txData = null;
+      try {
+        txData = await sendRpcRequest('gettransaction', [txid]);
+      } catch (e) {
+        // Fallback to getrawtransaction if gettransaction fails
+        txData = await sendRpcRequest('getrawtransaction', [txid, true]);
+      }
+      
+      if (txData) {
+        // Calculate transaction value
+        let totalValue = 0;
+        if (txData.vout && Array.isArray(txData.vout)) {
+          for (const output of txData.vout) {
+            if (output.value) {
+              totalValue += output.value;
+            }
+          }
+        }
+        
+        // Calculate fee (would need input values for accurate fee)
+        const estimatedFee = 0.0001 * (txData.vin ? txData.vin.length : 1);
+        const txSize = txData.vsize || txData.size || message.length / 2;
+        
+        const newTransaction = {
+          txid: txid,
+          value: totalValue,
+          size: txSize,
+          fee: estimatedFee,
+          feeRate: txSize > 0 ? Math.round((estimatedFee * 100000000) / txSize) : 0,
+          time: txData.time || Math.floor(Date.now() / 1000),
+          inputs: txData.vin ? txData.vin.length : 0,
+          outputs: txData.vout ? txData.vout.length : 0,
+          confirmations: 0,
+          inMempool: true
+        };
+        
+        // Broadcast to all WebSocket clients
+        const wsMessage = JSON.stringify({
+          type: 'newTransaction',
+          data: newTransaction
+        });
+        
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(wsMessage);
+            } catch (error) {
+              console.error('Error broadcasting new transaction:', error);
+            }
+          }
+        });
+        
+        console.log(`New transaction broadcast: ${txid}`);
+      }
+      
+    } catch (error) {
+      console.error('Error processing raw transaction:', error);
+    }
+  }
+}
+
+/**
+ * Handle incoming transaction hashes from ZeroMQ
+ * Lighter weight than raw transactions, fetches details as needed
+ */
+async function handleHashTransactions() {
+  for await (const [topic, message] of zmqSubHashTx) {
+    try {
+      const txid = message.toString('hex');
+      console.log(`New transaction hash: ${txid}`);
+      
+      // Optionally fetch full transaction details
+      // This is more efficient than processing raw transactions
+      
+    } catch (error) {
+      console.error('Error processing transaction hash:', error);
+    }
+  }
+}
+
+/**
+ * Handle incoming raw blocks from ZeroMQ
+ * Processes blocks to extract confirmed transactions
+ */
+async function handleRawBlocks() {
+  for await (const [topic, message] of zmqSubRawBlock) {
+    try {
+      // Calculate block hash
+      const blockHash = crypto.createHash('sha256')
+        .update(crypto.createHash('sha256').update(message.slice(0, 80)).digest())
+        .digest()
+        .reverse()
+        .toString('hex');
+      
+      console.log(`New block via ZeroMQ: ${blockHash}`);
+      
+      // Process the block using existing block notification logic
+      const fullBlock = await sendRpcRequest('getblock', [blockHash, 2]);
+      if (fullBlock && fullBlock.tx) {
+        // Update recent blocks cache
+        const coinbaseTx = fullBlock.tx[0];
+        const addressOutput = coinbaseTx.vout?.find(output => output?.scriptPubKey?.address);
+        const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
+        
+        const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
+        const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
+        
+        const newBlock = {
+          height: fullBlock.height,
+          hash: fullBlock.hash,
+          algo: getAlgoName(fullBlock.pow_algo),
+          txCount: fullBlock.nTx,
+          difficulty: fullBlock.difficulty,
+          timestamp: fullBlock.time,
+          minedTo: minerAddress,
+          minerAddress,
+          poolIdentifier,
+          taprootSignaling,
+          version: fullBlock.version
+        };
+        
+        updateRecentBlocksCache(newBlock);
+        broadcastNewBlock(newBlock);
+        
+        // Send recent transactions from this block
+        const blockTransactions = [];
+        for (let i = 1; i < Math.min(fullBlock.tx.length, 20); i++) {
+          const tx = fullBlock.tx[i];
+          if (!tx) continue;
+          
+          let totalValue = 0;
+          if (tx.vout && Array.isArray(tx.vout)) {
+            for (const output of tx.vout) {
+              if (output.value) {
+                totalValue += output.value;
+              }
+            }
+          }
+          
+          const txSize = tx.vsize || tx.size || 0;
+          const estimatedFee = 0.0001 * (tx.vin ? tx.vin.length : 1);
+          
+          blockTransactions.push({
+            txid: tx.txid || tx.hash,
+            blockHeight: fullBlock.height,
+            blockHash: fullBlock.hash,
+            time: tx.time || fullBlock.time,
+            value: totalValue,
+            size: txSize,
+            fee: estimatedFee,
+            feeRate: txSize > 0 ? Math.round((estimatedFee * 100000000) / txSize) : 0,
+            inputs: tx.vin ? tx.vin.length : 0,
+            outputs: tx.vout ? tx.vout.length : 0,
+            confirmations: 1
+          });
+        }
+        
+        // Broadcast confirmed transactions
+        if (blockTransactions.length > 0) {
+          const wsMessage = JSON.stringify({
+            type: 'confirmedTransactions',
+            data: blockTransactions
+          });
+          
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(wsMessage);
+              } catch (error) {
+                console.error('Error broadcasting confirmed transactions:', error);
+              }
+            }
+          });
+        }
+      }
+      
+    } catch (error) {
+      console.error('Error processing raw block from ZeroMQ:', error);
+    }
+  }
+}
+
+/**
+ * Cleanup ZeroMQ connections
+ */
+function cleanupZeroMQ() {
+  console.log('Cleaning up ZeroMQ connections...');
+  
+  if (zmqSubRawTx) {
+    zmqSubRawTx.close();
+    zmqSubRawTx = null;
+  }
+  
+  if (zmqSubHashTx) {
+    zmqSubHashTx.close();
+    zmqSubHashTx = null;
+  }
+  
+  if (zmqSubRawBlock) {
+    zmqSubRawBlock.close();
+    zmqSubRawBlock = null;
+  }
+  
+  if (zmqSubHashBlock) {
+    zmqSubHashBlock.close();
+    zmqSubHashBlock = null;
+  }
+  
+  console.log('ZeroMQ cleanup complete');
+}
+
+// ============================================================================
 // SERVER STARTUP AND INITIALIZATION
 // ============================================================================
 
@@ -1184,8 +1975,18 @@ async function startServer() {
       console.log('  Continuing without peer data - will retry in background');
     }
 
-    // Phase 4: Setup periodic maintenance tasks
-    console.log('\nPhase 4: Setting up periodic maintenance...');
+    // Phase 4: Initialize ZeroMQ for real-time transaction monitoring
+    console.log('\nPhase 4: Initializing ZeroMQ for real-time monitoring...');
+    try {
+      await initializeZeroMQ();
+      console.log('✓ ZeroMQ initialized successfully');
+    } catch (zmqError) {
+      console.error('⚠ ZeroMQ initialization failed:', zmqError.message);
+      console.log('  Continuing with polling-based updates');
+    }
+
+    // Phase 5: Setup periodic maintenance tasks
+    console.log('\nPhase 5: Setting up periodic maintenance...');
     
     // Blockchain data updates (every minute)
     setInterval(() => {
@@ -1209,6 +2010,15 @@ async function startServer() {
       saveCacheToDisk().catch(err => 
         console.error('Cache save failed:', err));
     }, 60000);
+    
+    // Optional: Mempool monitoring (every 10 seconds)
+    // Uncomment the following block to enable real-time mempool updates
+    /*
+    setInterval(() => {
+      monitorMempoolChanges().catch(err => 
+        console.error('Mempool monitoring error:', err));
+    }, 10000);
+    */
 
     console.log('✓ Periodic maintenance scheduled');
 
@@ -1236,6 +2046,19 @@ async function startServer() {
 // ============================================================================
 // APPLICATION ENTRY POINT
 // ============================================================================
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nReceived SIGINT, shutting down gracefully...');
+  cleanupZeroMQ();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\nReceived SIGTERM, shutting down gracefully...');
+  cleanupZeroMQ();
+  process.exit(0);
+});
 
 // Start the server
 startServer();
