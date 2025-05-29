@@ -8,6 +8,7 @@ This README provides comprehensive instructions for running and understanding th
 - [Test Suite Overview](#test-suite-overview)
 - [Running Tests](#running-tests)
 - [Test Categories](#test-categories)
+- [Coverage Reports](#coverage-reports)
 - [Test Development](#test-development)
 - [CI/CD Integration](#cicd-integration)
 - [Troubleshooting](#troubleshooting)
@@ -16,7 +17,7 @@ This README provides comprehensive instructions for running and understanding th
 
 ### Prerequisites
 
-- Node.js 14+ installed
+- Node.js 16+ installed
 - npm or yarn package manager
 - SQLite3 support (usually included with Node.js)
 
@@ -26,8 +27,8 @@ This README provides comprehensive instructions for running and understanding th
 # Install all dependencies including test dependencies
 npm install
 
-# Verify installation
-npm run test --version
+# Verify Vitest installation
+npx vitest --version
 ```
 
 ### Run All Tests
@@ -38,32 +39,40 @@ npm test
 
 # Run tests with coverage report
 npm run test:coverage
+
+# Run tests in watch mode
+npm run test:watch
 ```
 
 ## Test Suite Overview
 
 ### Test Statistics
 
+- **Test Framework**: Vitest 1.6.1
 - **Total Test Files**: 6 test files
-- **Total Test Cases**: 296+ individual tests
+- **Total Test Cases**: 97 individual tests
 - **Coverage Target**: >90% for all metrics
-- **Execution Time**: ~30-60 seconds for full suite
+- **Execution Time**: ~5-6 seconds for full suite
+- **Pass Rate**: 100% (97/97 tests passing)
 
 ### Test Architecture
 
 ```
 tests/
-├── unit/                    # 89 unit tests
-│   ├── rpc.test.js         # RPC module functionality (45 tests)
-│   └── server-core.test.js # Core server functions (44 tests)
-├── integration/             # 127 integration tests
-│   ├── api.test.js         # HTTP API endpoints (31 tests)
-│   ├── websocket.test.js   # WebSocket functionality (34 tests)
-│   ├── database.test.js    # Database operations (42 tests)
-│   └── end-to-end.test.js  # Complete workflows (20 tests)
+├── unit/                    # 25 unit tests
+│   ├── rpc.test.js         # RPC module functionality (19 tests)
+│   └── server-core.test.js # Core server functions (6 tests)
+├── integration/             # 72 integration tests
+│   ├── api.test.js         # HTTP API endpoints (32 tests)
+│   ├── websocket.test.js   # WebSocket functionality (19 tests)
+│   ├── database.test.js    # Database operations (10 tests)
+│   └── end-to-end.test.js  # Complete workflows (11 tests)
 ├── fixtures/                # Mock data and test fixtures
 ├── helpers/                 # Test utilities and setup
 └── coverage/               # Generated coverage reports
+    ├── index.html          # Main coverage dashboard
+    ├── rpc.js.html         # RPC file coverage details
+    └── server.js.html      # Server file coverage details
 ```
 
 ## Running Tests
@@ -74,14 +83,14 @@ tests/
 # Run all tests
 npm test
 
-# Run all tests with detailed output
-npm run test:verbose
-
 # Run tests in watch mode (re-runs on file changes)
 npm run test:watch
 
 # Generate coverage report
 npm run test:coverage
+
+# Run tests with debugging
+npm run test:debug
 ```
 
 ### Specific Test Categories
@@ -94,29 +103,26 @@ npm run test:unit
 npm run test:integration
 
 # Run specific test file
-npx jest tests/unit/rpc.test.js
+npx vitest run tests/unit/rpc.test.js
 
 # Run tests matching a pattern
-npx jest --testNamePattern="should handle RPC"
+npx vitest run --reporter=verbose --grep="should handle RPC"
 ```
 
 ### Advanced Options
 
 ```bash
-# Run tests in parallel (default)
-npm test -- --maxWorkers=4
-
-# Run tests serially (for debugging)
-npm test -- --runInBand
-
 # Run tests with specific timeout
-npm test -- --testTimeout=10000
+npx vitest run --testTimeout=10000
+
+# Run tests with specific reporter
+npx vitest run --reporter=verbose
 
 # Run only changed tests (with git)
-npm test -- --onlyChanged
+npx vitest run --changed
 
-# Update snapshots (if using snapshot testing)
-npm test -- --updateSnapshot
+# Run tests with UI interface
+npx vitest --ui
 ```
 
 ## Test Categories
@@ -126,8 +132,8 @@ npm test -- --updateSnapshot
 **Purpose**: Test individual functions and modules in isolation
 
 **Files**:
-- `rpc.test.js` - Tests RPC functionality, caching, rate limiting
-- `server-core.test.js` - Tests core server functions without HTTP dependencies
+- `rpc.test.js` - Tests RPC functionality, caching, rate limiting (19 tests)
+- `server-core.test.js` - Tests core server functions without HTTP dependencies (6 tests)
 
 **Example Command**:
 ```bash
@@ -148,10 +154,10 @@ npm run test:unit
 **Purpose**: Test component interactions and system integration
 
 **Files**:
-- `api.test.js` - HTTP API endpoint testing
-- `websocket.test.js` - WebSocket connection and messaging
-- `database.test.js` - SQLite database operations
-- `end-to-end.test.js` - Complete application workflows
+- `api.test.js` - HTTP API endpoint testing (32 tests)
+- `websocket.test.js` - WebSocket connection and messaging (19 tests)
+- `database.test.js` - SQLite database operations (10 tests)
+- `end-to-end.test.js` - Complete application workflows (11 tests)
 
 **Example Command**:
 ```bash
@@ -176,13 +182,80 @@ npm run test:integration
 - Memory usage patterns
 - Response time requirements
 
+## Coverage Reports
+
+### Viewing Coverage Reports
+
+```bash
+# Generate coverage report
+npm run test:coverage
+
+# Open HTML coverage report (Mac)
+open tests/coverage/index.html
+
+# Open HTML coverage report (Linux)
+xdg-open tests/coverage/index.html
+
+# Open HTML coverage report (Windows)
+start tests/coverage/index.html
+```
+
+### Coverage Report Features
+
+The HTML coverage reports provide:
+
+1. **Main Dashboard** (`index.html`):
+   - Overall coverage statistics
+   - File-by-file coverage breakdown
+   - Interactive navigation
+
+2. **File-Specific Reports** (`rpc.js.html`, `server.js.html`):
+   - Line-by-line coverage highlighting
+   - Green = covered lines
+   - Red = uncovered lines
+   - Branch coverage indicators
+
+3. **Coverage Metrics**:
+   - **Lines**: Percentage of code lines executed
+   - **Functions**: Percentage of functions called
+   - **Branches**: Percentage of conditional branches taken
+   - **Statements**: Percentage of statements executed
+
+### Current Coverage Status
+
+| File | Statements | Branches | Functions | Lines |
+|------|------------|----------|-----------|-------|
+| rpc.js | 82.51% | 79.16% | 100% | 82.51% |
+| Overall | 32.78% | 78.08% | 94.44% | 32.78% |
+
+### Coverage Goals
+
+| Metric | Target | 
+|--------|--------|
+| Lines | >85% |
+| Functions | >90% |
+| Branches | >80% |
+| Statements | >85% |
+
+### Improving Coverage
+
+```bash
+# Generate coverage with detailed output
+npm run test:coverage -- --reporter=verbose
+
+# View coverage for specific file
+npx vitest run --coverage --reporter=verbose tests/unit/rpc.test.js
+```
+
 ## Test Development
 
 ### Writing New Tests
 
-#### Basic Test Structure
+#### Basic Test Structure (Vitest)
 
 ```javascript
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
+
 describe('Feature Name', () => {
   beforeEach(() => {
     // Setup for each test
@@ -205,26 +278,49 @@ describe('Feature Name', () => {
 });
 ```
 
+#### Using Vitest Mocking
+
+```javascript
+import { vi } from 'vitest';
+
+// Mock a module
+vi.mock('axios', () => ({
+  default: {
+    get: vi.fn(),
+    post: vi.fn()
+  }
+}));
+
+// Mock a function
+const mockFunction = vi.fn();
+mockFunction.mockReturnValue('mocked result');
+
+// Spy on existing function
+const spy = vi.spyOn(object, 'method');
+```
+
 #### Using Test Utilities
 
 ```javascript
-const { createTestDatabase, mockAxios } = require('./helpers/test-utils');
+const { createTestDatabase } = require('./helpers/test-utils');
 const { mockBlockchainInfo } = require('./fixtures/mock-rpc-responses');
 
 test('should use test utilities', async () => {
   // Use pre-built test database
   const db = createTestDatabase();
   
-  // Use mock RPC responses
-  const mockRpc = mockAxios();
-  mockRpc.mockResponse('getblockchaininfo', [], mockBlockchainInfo);
+  // Test implementation with async/await (no done() callbacks)
+  const result = await new Promise((resolve, reject) => {
+    db.get('SELECT * FROM test', (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
   
-  // Test implementation
-  // ...
+  expect(result).toBeDefined();
   
   // Cleanup
-  db.close();
-  mockRpc.restore();
+  await new Promise(resolve => db.close(resolve));
 });
 ```
 
@@ -241,8 +337,8 @@ describe('User Management', () => {
     testDb = createTestDatabase();
   });
   
-  afterEach((done) => {
-    testDb.close(done);
+  afterEach(async () => {
+    await new Promise(resolve => testDb.close(resolve));
   });
 });
 
@@ -253,7 +349,25 @@ beforeAll(() => {
 });
 ```
 
-#### 2. Descriptive Test Names
+#### 2. Async/Await Pattern (No done() callbacks)
+
+```javascript
+// ✅ Good - Use async/await
+test('should handle async operations', async () => {
+  const result = await asyncFunction();
+  expect(result).toBeDefined();
+});
+
+// ❌ Bad - done() callbacks are deprecated in Vitest
+test('should handle async operations', (done) => {
+  asyncFunction((result) => {
+    expect(result).toBeDefined();
+    done(); // Deprecated!
+  });
+});
+```
+
+#### 3. Descriptive Test Names
 
 ```javascript
 // ✅ Good - Describes what and when
@@ -263,7 +377,7 @@ test('should return cached blockchain info when cache hit occurs', () => {});
 test('blockchain test', () => {});
 ```
 
-#### 3. Comprehensive Assertions
+#### 4. Comprehensive Assertions
 
 ```javascript
 // ✅ Good - Tests complete response structure
@@ -281,52 +395,13 @@ expect(response.body).toBeDefined();
 
 1. **Create test file** in appropriate directory (`unit/` or `integration/`)
 2. **Follow naming convention**: `feature-name.test.js`
-3. **Import required utilities**:
+3. **Import Vitest utilities**:
    ```javascript
+   import { describe, test, expect, vi } from 'vitest';
    const { createTestDatabase } = require('../helpers/test-utils');
    const { mockData } = require('../fixtures/test-data');
    ```
-4. **Add to Jest configuration** (automatic for `*.test.js` files)
-
-## Coverage Reports
-
-### Viewing Coverage
-
-```bash
-# Generate and view coverage
-npm run test:coverage
-
-# Open HTML coverage report
-open tests/coverage/lcov-report/index.html
-```
-
-### Coverage Metrics
-
-The test suite tracks four key metrics:
-
-- **Lines**: Percentage of code lines executed
-- **Functions**: Percentage of functions called
-- **Branches**: Percentage of conditional branches taken
-- **Statements**: Percentage of statements executed
-
-### Coverage Goals
-
-| Metric | Target | Current |
-|--------|--------|---------|
-| Lines | >90% | ~95% |
-| Functions | >90% | ~95% |
-| Branches | >85% | ~90% |
-| Statements | >90% | ~95% |
-
-### Improving Coverage
-
-```bash
-# Identify uncovered code
-npm run test:coverage -- --verbose
-
-# Run tests for specific file to see coverage
-npx jest --coverage --collectCoverageFrom="rpc.js" tests/unit/rpc.test.js
-```
+4. **Auto-detected** by Vitest (files matching `*.test.js` pattern)
 
 ## CI/CD Integration
 
@@ -343,13 +418,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [14, 16, 18]
+        node-version: [16, 18, 20]
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Setup Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
@@ -378,14 +453,12 @@ npm install --save-dev husky
 {
   "scripts": {
     "prepare": "husky install"
-  },
-  "husky": {
-    "hooks": {
-      "pre-commit": "npm run test:unit",
-      "pre-push": "npm run test:coverage"
-    }
   }
 }
+
+# Create pre-commit hook
+npx husky add .husky/pre-commit "npm run test:unit"
+npx husky add .husky/pre-push "npm run test:coverage"
 ```
 
 ### Docker Testing
@@ -393,7 +466,7 @@ npm install --save-dev husky
 Create `Dockerfile.test`:
 
 ```dockerfile
-FROM node:16-alpine
+FROM node:18-alpine
 
 WORKDIR /app
 COPY package*.json ./
@@ -420,7 +493,7 @@ docker run --rm dgb-stats-test
 
 ```bash
 # Increase timeout globally
-npm test -- --testTimeout=30000
+npx vitest run --testTimeout=30000
 
 # Or set in specific test
 test('long running test', async () => {
@@ -439,37 +512,41 @@ const testPort = 5000 + Math.floor(Math.random() * 1000);
 
 ```javascript
 // Always close databases in tests
-afterEach((done) => {
+afterEach(async () => {
   if (testDb) {
-    testDb.close(done);
-  } else {
-    done();
+    await new Promise(resolve => testDb.close(resolve));
   }
 });
 ```
 
-#### 4. Memory Issues
+#### 4. Vitest Configuration Issues
 
-```bash
-# Increase Node.js memory limit
-node --max-old-space-size=4096 node_modules/.bin/jest
+Check `vitest.config.js` or `package.json` for configuration:
 
-# Or set in package.json
-{
-  "scripts": {
-    "test": "node --max-old-space-size=4096 node_modules/.bin/jest"
+```javascript
+// vitest.config.js
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    globals: true,
+    environment: 'node',
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'html', 'lcov']
+    }
   }
-}
+});
 ```
 
 ### Debug Mode
 
 ```bash
 # Run tests in debug mode
-node --inspect-brk node_modules/.bin/jest --runInBand
+npm run test:debug
 
 # Run specific test with debugging
-node --inspect-brk node_modules/.bin/jest --runInBand tests/unit/rpc.test.js
+npx vitest run --inspect-brk tests/unit/rpc.test.js
 ```
 
 ### Environment Variables
@@ -496,10 +573,10 @@ LOG_LEVEL=error
 
 ```bash
 # See detailed test output
-npm run test:verbose
+npx vitest run --reporter=verbose
 
 # See console logs in tests
-npm test -- --verbose --no-silent
+npx vitest run --reporter=verbose --no-silent
 ```
 
 ## Performance Optimization
@@ -507,37 +584,34 @@ npm test -- --verbose --no-silent
 ### Parallel Execution
 
 ```bash
-# Use all CPU cores
-npm test -- --maxWorkers=100%
+# Use all CPU cores (default in Vitest)
+npm test
 
-# Use specific number of workers
-npm test -- --maxWorkers=4
+# Disable parallel execution for debugging
+npx vitest run --no-file-parallelism
 
-# Run serially for debugging
-npm test -- --runInBand
+# Run with specific number of threads
+npx vitest run --pool.threads.maxThreads=4
 ```
 
 ### Test Selection
 
 ```bash
 # Run only changed tests
-npm test -- --onlyChanged
+npx vitest run --changed
 
 # Run tests related to specific files
-npm test -- --findRelatedTests rpc.js server.js
+npx vitest run --related rpc.js server.js
 
-# Skip slow tests during development
-npm test -- --testNamePattern="^(?!.*slow).*"
+# Run tests matching pattern
+npx vitest run --grep "RPC"
 ```
 
 ### Cache Management
 
 ```bash
-# Clear Jest cache
-npx jest --clearCache
-
-# Disable cache for single run
-npm test -- --no-cache
+# No manual cache clearing needed in Vitest
+# Vitest handles caching automatically
 ```
 
 ## Monitoring and Maintenance
@@ -553,10 +627,10 @@ npm test -- --no-cache
 
 ```bash
 # Track test execution time
-npm test -- --verbose | grep "Time:"
+npm test | grep "Duration"
 
-# Profile test performance
-npm test -- --logHeapUsage
+# Use Vitest UI for detailed monitoring
+npx vitest --ui
 ```
 
 ### Updating Tests
@@ -574,16 +648,17 @@ When updating application code:
 
 1. **Check this README** for common solutions
 2. **Review test output** for specific error messages
-3. **Check Jest documentation** for framework-specific issues
+3. **Check Vitest documentation** at https://vitest.dev
 4. **Open an issue** with detailed reproduction steps
 
 ### Contributing Tests
 
 1. **Follow existing patterns** in test structure
-2. **Add comprehensive coverage** for new features
-3. **Include both positive and negative test cases**
-4. **Update documentation** for new test utilities
-5. **Ensure tests pass** in CI environment
+2. **Use async/await** instead of done() callbacks
+3. **Add comprehensive coverage** for new features
+4. **Include both positive and negative test cases**
+5. **Update documentation** for new test utilities
+6. **Ensure tests pass** in CI environment
 
 ### Test Quality Guidelines
 
