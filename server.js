@@ -191,7 +191,8 @@ wss.on('connection', (ws) => {
     data: recentBlocks 
   }));
   
-  // Send recent transactions from blocks
+  // Send recent confirmed transactions
+  console.log('📝 Initiating confirmed transactions fetch for new client...');
   sendRecentTransactionsToClient(ws);
 
   // Send cached initial data
@@ -1085,178 +1086,161 @@ function broadcastGeoData(geoNodes) {
 }
 
 /**
- * Fetch and send recent transactions from blockchain to a specific client
+ * Fetch and send recent confirmed transactions to a specific client
+ * Simplified and optimized version that focuses on reliability over completeness
  * @param {WebSocket} ws - WebSocket connection
  */
 async function sendRecentTransactionsToClient(ws) {
   try {
-    console.log('Fetching recent blockchain transactions...');
+    console.log('Fetching 10 most recent confirmed transactions...');
     
-    // Get transactions from the last few blocks
     const transactions = [];
-    const blocksToCheck = Math.min(5, recentBlocks.length); // Check last 5 blocks
+    const blocksToCheck = Math.min(3, recentBlocks.length); // Check last 3 blocks only
     
-    for (let i = 0; i < blocksToCheck; i++) {
+    for (let i = 0; i < blocksToCheck && transactions.length < 10; i++) {
       const block = recentBlocks[i];
       if (!block || !block.hash) continue;
       
       try {
         // Get full block data with transactions
         const fullBlock = await sendRpcRequest('getblock', [block.hash, 2]);
-        if (!fullBlock || !fullBlock.tx) continue;
+        if (!fullBlock || !fullBlock.tx || fullBlock.tx.length <= 1) continue;
         
-        // Process each transaction in the block (skip coinbase)
-        for (let j = 1; j < Math.min(fullBlock.tx.length, 20); j++) { // Limit to 20 txs per block
+        console.log(`Processing block ${fullBlock.height} with ${fullBlock.tx.length} transactions`);
+        
+        // Process transactions (skip coinbase, limit to prevent overload)
+        const txsToProcess = Math.min(fullBlock.tx.length - 1, 10);
+        
+        for (let j = 1; j <= txsToProcess && transactions.length < 10; j++) {
           const tx = fullBlock.tx[j];
-          if (!tx) continue;
+          if (!tx || !tx.txid) continue;
           
           try {
-            // Use the enhanced transaction data fetcher with proper fallback handling
-            let enhancedTxData = await getTransactionData(tx.txid, fullBlock.hash);
-            
-            // If getTransactionData returns null, use the raw transaction data we already have
-            if (!enhancedTxData) {
-              console.log(`Using raw transaction data for ${tx.txid} from block ${fullBlock.height}`);
-              enhancedTxData = tx;
-            }
-            
-            // Calculate transaction value and process inputs/outputs
+            // Use simpler data extraction from block data
             let totalValue = 0;
             let inputs = [];
             let outputs = [];
-            let actualFee = 0;
             
-            if (enhancedTxData.details && Array.isArray(enhancedTxData.details)) {
-              // gettransaction response format
-              totalValue = Math.abs(enhancedTxData.amount || 0);
-              actualFee = enhancedTxData.fee ? Math.abs(enhancedTxData.fee) : 0;
-              
-              outputs = enhancedTxData.details.map(detail => ({
-                address: detail.address || '',
-                amount: detail.amount || 0,
-                category: detail.category || '',
-                vout: detail.vout || 0
-              }));
-            } else {
-              // Raw transaction format
-              if (tx.vout && Array.isArray(tx.vout)) {
-                for (const output of tx.vout) {
-                  if (output.value) {
-                    totalValue += output.value;
-                    outputs.push({
-                      address: output.scriptPubKey?.address || '',
-                      amount: output.value,
-                      type: output.scriptPubKey?.type || '',
-                      vout: output.n || 0
-                    });
-                  }
-                }
-              }
-              
-              // Process inputs
-              if (tx.vin && Array.isArray(tx.vin)) {
-                inputs = tx.vin.map(input => ({
-                  txid: input.txid || '',
-                  vout: input.vout || 0,
-                  address: '', // Would need previous tx data
-                  amount: 0    // Would need previous tx data
-                }));
-              }
-              
-              // Estimate fee for raw transactions
-              actualFee = 0.0001 * (tx.vin ? tx.vin.length : 1);
-            }
-            
-            // Calculate size and fee rate
-            const txSize = enhancedTxData.vsize || enhancedTxData.size || tx.vsize || tx.size || 0;
-            const feeRate = txSize > 0 && actualFee > 0 ? Math.round((actualFee * 100000000) / txSize) : 0;
-            
-            // Determine priority based on fee rate
-            let priority = 'low';
-            if (feeRate > 100) priority = 'high';
-            else if (feeRate > 50) priority = 'medium';
-            
-            transactions.push({
-              txid: tx.txid || tx.hash,
-              blockHeight: fullBlock.height,
-              blockHash: fullBlock.hash,
-              blocktime: fullBlock.time,
-              time: enhancedTxData.time || tx.time || fullBlock.time,
-              timereceived: enhancedTxData.timereceived || fullBlock.time,
-              value: totalValue,
-              size: txSize,
-              vsize: enhancedTxData.vsize || tx.vsize || txSize,
-              fee: actualFee,
-              feeRate: feeRate,
-              priority: priority,
-              inputs: inputs,
-              outputs: outputs,
-              confirmations: block.height ? (recentBlocks[0].height - block.height + 1) : 1,
-              generated: enhancedTxData.generated || false,
-              replaceable: enhancedTxData['bip125-replaceable'] || 'no'
-            });
-            
-          } catch (txError) {
-            console.error(`Error processing transaction ${tx.txid}:`, txError.message);
-            
-            // Add basic transaction data even if enhanced processing fails
-            let totalValue = 0;
+            // Process outputs from block data
             if (tx.vout && Array.isArray(tx.vout)) {
               for (const output of tx.vout) {
                 if (output.value) {
                   totalValue += output.value;
+                  outputs.push({
+                    address: output.scriptPubKey?.address || 'Unknown',
+                    amount: output.value,
+                    type: output.scriptPubKey?.type || ''
+                  });
                 }
               }
             }
             
-            const txSize = tx.vsize || tx.size || 0;
-            const estimatedFee = 0.0001 * (tx.vin ? tx.vin.length : 1);
+            // Process inputs from block data (basic info only)
+            if (tx.vin && Array.isArray(tx.vin)) {
+              inputs = tx.vin.map(input => ({
+                txid: input.txid || '',
+                vout: input.vout !== undefined ? input.vout : -1,
+                address: '', // Cannot determine without additional RPC call
+                amount: 0    // Cannot determine without additional RPC call
+              }));
+            }
+            
+            // Estimate fee (simple calculation)
+            const estimatedFee = 0.0001 * (inputs.length || 1);
+            const txSize = tx.vsize || tx.size || 250; // Default size estimate
+            const feeRate = Math.round((estimatedFee * 100000000) / txSize);
+            
+            // Determine priority based on estimated fee rate
+            let priority = 'low';
+            if (feeRate > 100) priority = 'high';
+            else if (feeRate > 50) priority = 'medium';
+            
+            // Calculate confirmations
+            const confirmations = recentBlocks[0] ? (recentBlocks[0].height - fullBlock.height + 1) : 1;
             
             transactions.push({
-              txid: tx.txid || tx.hash,
+              txid: tx.txid,
               blockHeight: fullBlock.height,
               blockHash: fullBlock.hash,
               blocktime: fullBlock.time,
-              time: tx.time || fullBlock.time,
-              timereceived: fullBlock.time,
+              time: fullBlock.time,
               value: totalValue,
               size: txSize,
-              vsize: txSize,
+              vsize: tx.vsize || txSize,
               fee: estimatedFee,
-              feeRate: txSize > 0 ? Math.round((estimatedFee * 100000000) / txSize) : 0,
-              priority: 'low',
-              inputs: tx.vin ? tx.vin.length : 0,
-              outputs: tx.vout ? tx.vout.length : 0,
-              confirmations: block.height ? (recentBlocks[0].height - block.height + 1) : 1,
-              generated: false,
-              replaceable: 'no'
+              fee_rate: feeRate,
+              priority: priority,
+              inputs: inputs,
+              outputs: outputs,
+              confirmations: confirmations
             });
+            
+            console.log(`Added transaction ${tx.txid.substring(0, 8)}... (${totalValue.toFixed(2)} DGB)`);
+            
+          } catch (txError) {
+            console.error(`Error processing transaction ${tx.txid}:`, txError.message);
+            // Continue with next transaction rather than failing completely
           }
         }
         
       } catch (blockError) {
         console.error(`Error processing block ${block.hash}:`, blockError.message);
+        // Continue with next block rather than failing completely
       }
     }
     
-    // Sort by most recent first
-    transactions.sort((a, b) => b.time - a.time);
+    // Sort by most recent first (by block height, then by position in block)
+    transactions.sort((a, b) => {
+      if (a.blockHeight !== b.blockHeight) {
+        return b.blockHeight - a.blockHeight;
+      }
+      return b.time - a.time;
+    });
+    
+    // Limit to exactly 10 most recent transactions
+    const recentTransactions = transactions.slice(0, 10);
     
     // Send to client
     ws.send(JSON.stringify({
       type: 'recentTransactions',
-      data: transactions.slice(0, 50) // Limit to 50 most recent
+      data: recentTransactions
     }));
     
-    console.log(`Sent ${transactions.length} recent transactions to client`);
+    console.log(`✅ Sent ${recentTransactions.length} recent confirmed transactions to client`);
+    
+    if (recentTransactions.length > 0) {
+      console.log(`   Latest: ${recentTransactions[0].txid.substring(0, 8)}... (Block ${recentTransactions[0].blockHeight})`);
+      console.log(`   Oldest: ${recentTransactions[recentTransactions.length-1].txid.substring(0, 8)}... (Block ${recentTransactions[recentTransactions.length-1].blockHeight})`);
+    }
     
   } catch (error) {
-    console.error('Error fetching recent transactions:', error);
-    // Send empty array on error
+    console.error('❌ Error fetching recent transactions:', error);
+    
+    // Send placeholder data instead of empty array to provide user feedback
+    const placeholderTransactions = recentBlocks.slice(0, 3).map((block, index) => ({
+      txid: `placeholder-${block.height}-${index}`,
+      blockHeight: block.height,
+      blockHash: block.hash,
+      blocktime: block.timestamp,
+      time: block.timestamp,
+      value: 0,
+      size: 250,
+      vsize: 250,
+      fee: 0.0001,
+      fee_rate: 40,
+      priority: 'medium',
+      inputs: [],
+      outputs: [],
+      confirmations: recentBlocks[0] ? (recentBlocks[0].height - block.height + 1) : 1,
+      placeholder: true // Mark as placeholder for frontend
+    }));
+    
     ws.send(JSON.stringify({
       type: 'recentTransactions',
-      data: []
+      data: placeholderTransactions
     }));
+    
+    console.log(`⚠️  Sent ${placeholderTransactions.length} placeholder transactions due to error`);
   }
 }
 

@@ -2,21 +2,21 @@
   "initialData": {
     "blockchainInfo": {
       "chain": "main",
-      "blocks": 21471265,
-      "headers": 21471265,
-      "bestblockhash": "000000000000000196820cbc8a3466578be8b3f754773cc7e3b25845ed409f54",
-      "mediantime": 1748552533,
-      "verificationprogress": 0.9999999459105069,
+      "blocks": 21471336,
+      "headers": 21471336,
+      "bestblockhash": "000000000000000034440a83197202160c26f387e0344cd885fb86d678ffeaac",
+      "mediantime": 1748553681,
+      "verificationprogress": 0.9999999680380868,
       "initialblockdownload": false,
-      "chainwork": "00000000000000000000000000000000000000000018aeaa727f5e445fb2024c",
-      "size_on_disk": 33723435141,
+      "chainwork": "00000000000000000000000000000000000000000018aeb48471a40b8d451a4c",
+      "size_on_disk": 33723479652,
       "pruned": false,
       "difficulties": {
-        "sha256d": 901170464.602115,
-        "scrypt": 386528.3093534664,
-        "skein": 26269139.90108709,
-        "qubit": 1011612.064103107,
-        "odo": 152526.7891510842
+        "sha256d": 999473337.1802329,
+        "scrypt": 500805.6885598045,
+        "skein": 14338556.49456841,
+        "qubit": 779364.6043899804,
+        "odo": 232966.7260849372
       },
       "softforks": {
         "bip34": {
@@ -76,26 +76,26 @@
       "warnings": ""
     },
     "chainTxStats": {
-      "time": 1748552630,
-      "txcount": 50635552,
-      "window_final_block_hash": "000000000000000196820cbc8a3466578be8b3f754773cc7e3b25845ed409f54",
-      "window_final_block_height": 21471265,
+      "time": 1748553832,
+      "txcount": 50635648,
+      "window_final_block_hash": "000000000000000034440a83197202160c26f387e0344cd885fb86d678ffeaac",
+      "window_final_block_height": 21471336,
       "window_block_count": 172800,
       "window_tx_count": 280452,
-      "window_interval": 2582618,
-      "txrate": 0.1085921340283387
+      "window_interval": 2582753,
+      "txrate": 0.1085864579384866
     },
     "txOutsetInfo": {
-      "height": 21471264,
-      "bestblock": "59a2be1ff74f635d9119ef67ec82e8292600e339580e18066098d649a8a25533",
-      "txouts": 14988136,
-      "bogosize": 1122816560,
-      "hash_serialized_2": "04818f25518c16cf8a56ee4e6e48dbebb6b3110df80f229c62d52128b78454fb",
-      "total_amount": 17717146083.559906,
-      "transactions": 4081033,
+      "height": 21471333,
+      "bestblock": "3d568b7da1f86cecd2c17325266fef77364f272ee99de82e98de2ac4ea28d39e",
+      "txouts": 14988165,
+      "bogosize": 1122818720,
+      "hash_serialized_2": "7d651f7b8d80af2a63dece136d591fa50c355be637867442445006a929392251",
+      "total_amount": 17717166786.69883,
+      "transactions": 4081061,
       "disk_size": 801380394
     },
     "blockReward": 300.04549168
   },
-  "timestamp": 1748552728165
+  "timestamp": 1748553876160
 }
