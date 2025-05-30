@@ -108,6 +108,42 @@ let connectedClients = 0;
 const recentBlocks = [];
 
 /**
+ * In-memory storage for recent confirmed transactions
+ * Maintains the latest confirmed transactions for immediate delivery
+ */
+let recentTransactionsCache = [];
+
+/**
+ * In-memory storage for current mempool state
+ * Maintains current mempool transactions and statistics for immediate delivery
+ */
+let mempoolCache = {
+  stats: {
+    size: 0,
+    bytes: 0,
+    usage: 0,
+    maxmempool: 300000000,
+    minfee: 0,
+    avgfee: 0,
+    totalfee: 0,
+    feeDistribution: {
+      '0-10': 0,
+      '10-50': 0,
+      '50-100': 0,
+      '100-500': 0,
+      '500+': 0
+    }
+  },
+  transactions: []
+};
+
+/**
+ * Track mempool transactions with timestamps for 3-minute retention
+ * This allows transactions to be analyzed even after they leave the real mempool
+ */
+const mempoolTransactionHistory = new Map(); // txid -> { transaction, addedAt, removedAt }
+
+/**
  * Multi-tier caching system:
  * - NodeCache: Short-term cache with automatic expiration
  * - In-memory: Critical data that persists across cache evictions
@@ -191,18 +227,25 @@ wss.on('connection', (ws) => {
     data: recentBlocks 
   }));
   
-  // Send recent confirmed transactions
-  console.log('📝 Initiating confirmed transactions fetch for new client...');
-  sendRecentTransactionsToClient(ws);
+  // Send cached confirmed transactions immediately
+  console.log(`Sending ${recentTransactionsCache.length} cached confirmed transactions to new client`);
+  ws.send(JSON.stringify({
+    type: 'recentTransactions',
+    data: recentTransactionsCache
+  }));
+  
+  // Send cached mempool data immediately
+  console.log(`Sending cached mempool data (${mempoolCache.transactions.length} transactions) to new client`);
+  ws.send(JSON.stringify({
+    type: 'mempool',
+    data: mempoolCache
+  }));
 
   // Send cached initial data
   sendInitialDataToClient(ws);
   
   // Send geo-located peer data
   sendGeoDataToClient(ws);
-  
-  // Auto-send mempool data for TxsPage
-  sendMempoolDataToClient(ws);
 
   // Handle incoming messages from client
   ws.on('message', async (message) => {
@@ -713,6 +756,9 @@ app.post('/api/blocknotify', async (req, res) => {
     // Update recent blocks cache
     updateRecentBlocksCache(newBlock);
 
+    // Handle transaction lifecycle: move confirmed transactions from mempool to confirmed list
+    await handleTransactionLifecycle(fullBlock);
+
     // Broadcast to all connected WebSocket clients
     broadcastNewBlock(newBlock);
 
@@ -739,6 +785,100 @@ function updateRecentBlocksCache(newBlock) {
   
   // Maintain maximum size
   recentBlocks.splice(SERVER_CONFIG.maxRecentBlocks);
+}
+
+/**
+ * Handle transaction lifecycle when a new block is mined
+ * Moves transactions from mempool to confirmed list and broadcasts updates
+ * 
+ * @param {object} fullBlock - Complete block data with transactions
+ */
+async function handleTransactionLifecycle(fullBlock) {
+  try {
+    if (!fullBlock || !fullBlock.tx || fullBlock.tx.length <= 1) return;
+    
+    const confirmedTxIds = fullBlock.tx.slice(1).map(tx => tx.txid || tx.hash); // Skip coinbase
+    const confirmedTransactions = [];
+    
+    console.log(`🔄 Processing ${confirmedTxIds.length} confirmed transactions from block ${fullBlock.height}`);
+    
+    // Check which mempool transactions were confirmed in this block
+    const removedFromMempool = [];
+    mempoolCache.transactions = mempoolCache.transactions.filter(tx => {
+      if (confirmedTxIds.includes(tx.txid)) {
+        // This transaction was confirmed - move it to confirmed list
+        const confirmedTx = {
+          ...tx,
+          blockHeight: fullBlock.height,
+          blockHash: fullBlock.hash,
+          blocktime: fullBlock.time,
+          confirmations: 1
+        };
+        confirmedTransactions.push(confirmedTx);
+        removedFromMempool.push(tx.txid);
+        return false; // Remove from mempool
+      }
+      return true; // Keep in mempool
+    });
+    
+    // Add new confirmed transactions to the confirmed cache
+    if (confirmedTransactions.length > 0) {
+      // Add to beginning of confirmed transactions cache
+      recentTransactionsCache.unshift(...confirmedTransactions);
+      
+      // Keep only the most recent 10
+      recentTransactionsCache = recentTransactionsCache.slice(0, 10);
+      
+      console.log(`✅ Moved ${confirmedTransactions.length} transactions from mempool to confirmed`);
+      
+      // Broadcast the confirmed transactions to WebSocket clients
+      const message = JSON.stringify({
+        type: 'transactionConfirmed',
+        data: {
+          blockHeight: fullBlock.height,
+          blockHash: fullBlock.hash,
+          transactions: confirmedTransactions
+        }
+      });
+      
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(message);
+          } catch (error) {
+            console.error('Error broadcasting confirmed transactions:', error);
+          }
+        }
+      });
+    }
+    
+    // Update mempool stats after removing confirmed transactions
+    if (removedFromMempool.length > 0) {
+      mempoolCache.stats.size = Math.max(0, mempoolCache.stats.size - removedFromMempool.length);
+      
+      // Recalculate total fee
+      mempoolCache.stats.totalfee = mempoolCache.transactions.reduce((sum, tx) => sum + (tx.fee || 0), 0);
+      
+      // Broadcast updated mempool to clients
+      const mempoolMessage = JSON.stringify({
+        type: 'mempool',
+        data: mempoolCache
+      });
+      
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(mempoolMessage);
+          } catch (error) {
+            console.error('Error broadcasting updated mempool:', error);
+          }
+        }
+      });
+    }
+    
+  } catch (error) {
+    console.error('Error handling transaction lifecycle:', error);
+  }
 }
 
 /**
@@ -1086,8 +1226,357 @@ function broadcastGeoData(geoNodes) {
 }
 
 /**
+ * Update the cached confirmed transactions
+ * This function populates the recentTransactionsCache for immediate delivery
+ */
+async function updateConfirmedTransactionsCache() {
+  try {
+    console.log('🔄 Updating confirmed transactions cache...');
+    console.log(`   Recent blocks available: ${recentBlocks.length}`);
+    
+    const transactions = [];
+    const maxBlocksToCheck = 50; // Check up to 50 blocks to find transactions
+    const blocksToCheck = Math.min(maxBlocksToCheck, recentBlocks.length);
+    
+    let totalTxsFound = 0;
+    let blocksWithTxs = 0;
+    
+    for (let i = 0; i < blocksToCheck && transactions.length < 15; i++) {
+      const block = recentBlocks[i];
+      if (!block || !block.hash) {
+        console.log(`   Block ${i} is invalid, skipping...`);
+        continue;
+      }
+      
+      try {
+        const fullBlock = await sendRpcRequest('getblock', [block.hash, 2]);
+        if (!fullBlock || !fullBlock.tx) {
+          console.log(`   ⚠️  Block ${block.height} - Failed to get block data`);
+          continue;
+        }
+        
+        const nonCoinbaseTxs = fullBlock.tx.length - 1;
+        totalTxsFound += nonCoinbaseTxs;
+        
+        if (nonCoinbaseTxs > 0) {
+          blocksWithTxs++;
+          console.log(`   📦 Block ${fullBlock.height}: ${nonCoinbaseTxs} non-coinbase transactions`);
+        } else {
+          console.log(`   📦 Block ${fullBlock.height}: Only coinbase transaction (empty block)`);
+          continue;
+        }
+        
+        // Process all non-coinbase transactions (skip index 0 which is coinbase)
+        for (let j = 1; j < fullBlock.tx.length && transactions.length < 15; j++) {
+          const tx = fullBlock.tx[j];
+          if (!tx || !tx.txid) {
+            console.log(`      ⚠️  Transaction ${j} in block ${fullBlock.height} is invalid`);
+            continue;
+          }
+          
+          try {
+            let totalValue = 0;
+            let inputs = [];
+            let outputs = [];
+            
+            if (tx.vout && Array.isArray(tx.vout)) {
+              for (const output of tx.vout) {
+                if (output.value) {
+                  totalValue += output.value;
+                  outputs.push({
+                    address: output.scriptPubKey?.address || 'Unknown',
+                    amount: output.value,
+                    type: output.scriptPubKey?.type || ''
+                  });
+                }
+              }
+            }
+            
+            if (tx.vin && Array.isArray(tx.vin)) {
+              inputs = tx.vin.map(input => ({
+                txid: input.txid || '',
+                vout: input.vout !== undefined ? input.vout : -1,
+                address: '',
+                amount: 0
+              }));
+            }
+            
+            // More realistic fee estimation based on transaction size
+            const txSize = tx.vsize || tx.size || (inputs.length * 148 + outputs.length * 34 + 10);
+            const estimatedFee = Math.max(0.00001, txSize * 0.00000050); // ~50 sat/byte
+            const feeRate = Math.round((estimatedFee * 100000000) / txSize);
+            
+            let priority = 'low';
+            if (feeRate > 100) priority = 'high';
+            else if (feeRate > 50) priority = 'medium';
+            
+            const confirmations = recentBlocks[0] ? (recentBlocks[0].height - fullBlock.height + 1) : 1;
+            
+            const txData = {
+              txid: tx.txid,
+              blockHeight: fullBlock.height,
+              blockHash: fullBlock.hash,
+              blocktime: fullBlock.time,
+              time: fullBlock.time,
+              value: totalValue,
+              size: txSize,
+              vsize: tx.vsize || txSize,
+              fee: estimatedFee,
+              fee_rate: feeRate,
+              priority: priority,
+              inputs: inputs,
+              outputs: outputs,
+              confirmations: confirmations
+            };
+            
+            transactions.push(txData);
+            console.log(`      ✅ Processed tx ${tx.txid.substring(0, 8)}... value: ${totalValue.toFixed(4)} DGB, ${inputs.length} inputs, ${outputs.length} outputs`);
+            
+          } catch (txError) {
+            console.error(`Error processing transaction ${tx.txid}:`, txError.message);
+          }
+        }
+        
+      } catch (blockError) {
+        console.error(`Error processing block ${block.hash}:`, blockError.message);
+      }
+    }
+    
+    // Summary of search results
+    console.log(`   📊 Search Summary:`);
+    console.log(`      Blocks checked: ${blocksToCheck}`);
+    console.log(`      Blocks with transactions: ${blocksWithTxs}`);
+    console.log(`      Total transactions found: ${totalTxsFound}`);
+    console.log(`      Transactions processed: ${transactions.length}`);
+    
+    transactions.sort((a, b) => {
+      if (a.blockHeight !== b.blockHeight) {
+        return b.blockHeight - a.blockHeight;
+      }
+      return b.time - a.time;
+    });
+    
+    recentTransactionsCache = transactions.slice(0, 10);
+    console.log(`✅ Confirmed transactions cache updated: ${recentTransactionsCache.length} transactions`);
+    
+    if (recentTransactionsCache.length > 0) {
+      console.log(`   Latest: ${recentTransactionsCache[0].txid.substring(0, 8)}... (Block ${recentTransactionsCache[0].blockHeight})`);
+      console.log(`   Value: ${recentTransactionsCache[0].value.toFixed(8)} DGB`);
+      
+      // Broadcast updated confirmed transactions to all clients
+      const message = JSON.stringify({
+        type: 'recentTransactions',
+        data: recentTransactionsCache
+      });
+      
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(message);
+          } catch (error) {
+            console.error('Error broadcasting updated confirmed transactions:', error);
+          }
+        }
+      });
+    } else {
+      console.log(`   ⚠️  No confirmed transactions found in last ${blocksToCheck} blocks`);
+      console.log(`   💡 This could mean:`);
+      console.log(`      - Recent blocks only contain coinbase transactions`);
+      console.log(`      - Network has low transaction volume`);
+      console.log(`      - RPC connection issues`);
+    }
+    
+  } catch (error) {
+    console.error('❌ Error updating confirmed transactions cache:', error);
+    // Keep existing cache on error
+  }
+}
+
+/**
+ * Update the cached mempool state
+ * This function populates the mempoolCache for immediate delivery
+ */
+async function updateMempoolCache() {
+  try {
+    console.log('🔄 Updating mempool cache...');
+    
+    const mempoolInfo = await sendRpcRequest('getmempoolinfo');
+    const rawMempool = await sendRpcRequest('getrawmempool', [true]);
+    
+    console.log(`   📊 Mempool info: ${mempoolInfo?.size || 0} transactions, ${(mempoolInfo?.bytes / 1048576).toFixed(2) || 0} MB`);
+    
+    const transactions = [];
+    const txIds = Object.keys(rawMempool || {});
+    let totalFee = 0;
+    const feeDistribution = {
+      '0-10': 0,
+      '10-50': 0,
+      '50-100': 0,
+      '100-500': 0,
+      '500+': 0
+    };
+    
+    for (const txid of txIds.slice(0, 50)) {
+      const txData = rawMempool[txid];
+      if (!txData) continue;
+      
+      try {
+        const enhancedTxData = await getTransactionData(txid);
+        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+        
+        if (feeRate < 10) feeDistribution['0-10']++;
+        else if (feeRate < 50) feeDistribution['10-50']++;
+        else if (feeRate < 100) feeDistribution['50-100']++;
+        else if (feeRate < 500) feeDistribution['100-500']++;
+        else feeDistribution['500+']++;
+        
+        let priority = 'low';
+        if (feeRate > 100) priority = 'high';
+        else if (feeRate > 50) priority = 'medium';
+        
+        let totalValue = 0;
+        let inputs = [];
+        let outputs = [];
+        
+        if (enhancedTxData && enhancedTxData.vout && Array.isArray(enhancedTxData.vout)) {
+          for (const output of enhancedTxData.vout) {
+            if (output.value) {
+              totalValue += output.value;
+              outputs.push({
+                address: output.scriptPubKey?.address || '',
+                amount: output.value,
+                type: output.scriptPubKey?.type || ''
+              });
+            }
+          }
+          
+          if (enhancedTxData.vin && Array.isArray(enhancedTxData.vin)) {
+            inputs = enhancedTxData.vin.map(input => ({
+              txid: input.txid || '',
+              vout: input.vout || 0,
+              address: '',
+              amount: 0
+            }));
+          }
+        }
+        
+        totalFee += txData.fee || 0;
+        
+        transactions.push({
+          txid: txid,
+          size: txData.vsize || txData.size || 0,
+          vsize: txData.vsize || txData.size || 0,
+          fee: txData.fee || 0,
+          value: Math.abs(totalValue),
+          time: txData.time || Math.floor(Date.now() / 1000),
+          inputs: inputs,
+          outputs: outputs,
+          fee_rate: feeRate,
+          priority: priority,
+          confirmations: 0,
+          descendantcount: txData.descendantcount || 0,
+          descendantsize: txData.descendantsize || 0,
+          ancestorcount: txData.ancestorcount || 0,
+          ancestorsize: txData.ancestorsize || 0
+        });
+        
+      } catch (txError) {
+        console.error(`Error processing mempool transaction ${txid}:`, txError.message);
+      }
+    }
+    
+    // Update transaction history for 2-minute retention
+    const currentTime = Date.now();
+    const currentTxIds = new Set(txIds);
+    
+    // Mark removed transactions
+    for (const [txid, history] of mempoolTransactionHistory.entries()) {
+      if (!currentTxIds.has(txid) && !history.removedAt) {
+        history.removedAt = currentTime;
+        console.log(`   📤 Transaction ${txid.substring(0, 8)}... left mempool`);
+      }
+    }
+    
+    // Add new transactions to history
+    transactions.forEach(tx => {
+      if (!mempoolTransactionHistory.has(tx.txid)) {
+        mempoolTransactionHistory.set(tx.txid, {
+          transaction: tx,
+          addedAt: currentTime,
+          removedAt: null
+        });
+        console.log(`   📥 New transaction ${tx.txid.substring(0, 8)}... added to history`);
+      }
+    });
+    
+    // Clean up transactions older than 3 minutes
+    const threeMinutesAgo = currentTime - (3 * 60 * 1000);
+    for (const [txid, history] of mempoolTransactionHistory.entries()) {
+      if (history.removedAt && history.removedAt < threeMinutesAgo) {
+        mempoolTransactionHistory.delete(txid);
+        console.log(`   🗑️  Transaction ${txid.substring(0, 8)}... removed from history (>3 min old)`);
+      }
+    }
+    
+    // Include recent transactions in the displayed list
+    const displayTransactions = [];
+    for (const [txid, history] of mempoolTransactionHistory.entries()) {
+      if (!history.removedAt || (currentTime - history.removedAt) < 3 * 60 * 1000) {
+        displayTransactions.push({
+          ...history.transaction,
+          inMempool: !history.removedAt,
+          removedAt: history.removedAt
+        });
+      }
+    }
+    
+    displayTransactions.sort((a, b) => b.time - a.time);
+    
+    const avgFee = transactions.length > 0 
+      ? transactions.reduce((sum, tx) => sum + tx.fee, 0) / transactions.length
+      : 0;
+    
+    mempoolCache = {
+      stats: {
+        size: mempoolInfo?.size || 0,
+        bytes: mempoolInfo?.bytes || 0,
+        usage: mempoolInfo?.usage || 0,
+        maxmempool: mempoolInfo?.maxmempool || 300000000,
+        minfee: mempoolInfo?.mempoolminfee || mempoolInfo?.minrelaytxfee || 0.00001,
+        avgfee: avgFee,
+        totalfee: totalFee,
+        feeDistribution: feeDistribution
+      },
+      transactions: displayTransactions
+    };
+    
+    console.log(`✅ Mempool cache updated: ${transactions.length} active, ${displayTransactions.length} total (with history)`);
+    
+    // Broadcast updated mempool to all clients
+    const message = JSON.stringify({
+      type: 'mempool',
+      data: mempoolCache
+    });
+    
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(message);
+        } catch (error) {
+          console.error('Error broadcasting updated mempool:', error);
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error updating mempool cache:', error);
+    // Keep existing cache on error
+  }
+}
+
+/**
  * Fetch and send recent confirmed transactions to a specific client
- * Simplified and optimized version that focuses on reliability over completeness
+ * DEPRECATED: Now using cached data sent immediately on connection
  * @param {WebSocket} ws - WebSocket connection
  */
 async function sendRecentTransactionsToClient(ws) {
@@ -1949,6 +2438,13 @@ async function startServer() {
       fetchInitialData().then(() => console.log('✓ Initial blockchain data cached'))
     ]);
 
+    // Phase 2.5: Initialize transaction caches for instant TxsPage loading
+    console.log('\nPhase 2.5: Loading transaction caches...');
+    await Promise.all([
+      updateConfirmedTransactionsCache().then(() => console.log('✓ Confirmed transactions cache loaded')),
+      updateMempoolCache().then(() => console.log('✓ Mempool cache loaded'))
+    ]);
+
     // Phase 3: Load peer network data
     console.log('\nPhase 3: Loading peer network data...');
     try {
@@ -1982,6 +2478,17 @@ async function startServer() {
       fetchInitialData().catch(err => 
         console.error('Scheduled data update failed:', err));
     }, 60000);
+    
+    // Transaction cache updates (every 30 seconds for responsiveness)
+    setInterval(() => {
+      updateConfirmedTransactionsCache().catch(err => 
+        console.error('Scheduled confirmed transactions cache update failed:', err));
+    }, 30000);
+    
+    setInterval(() => {
+      updateMempoolCache().catch(err => 
+        console.error('Scheduled mempool cache update failed:', err));
+    }, 30000);
     
     // Peer data updates (every 10 minutes)
     setInterval(() => {
