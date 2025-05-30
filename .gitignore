@@ -28,3 +28,6 @@ nodes.db-journal
 
 # config
 config.js
+
+# cache files
+cache-backup.json
