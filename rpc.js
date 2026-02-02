@@ -28,11 +28,22 @@ const NodeCache = require('node-cache');
 // RPC Connection Settings
 const RPC_CONFIG = {
   user: process.env.DGB_RPC_USER || 'user',
-  password: process.env.DGB_RPC_PASSWORD || 'password', 
+  password: process.env.DGB_RPC_PASSWORD || 'password',
   url: process.env.DGB_RPC_URL || 'http://127.0.0.1:14044',
   timeout: {
     default: 30000,      // 30 seconds for most commands
     heavy: 120000        // 2 minutes for expensive operations like gettxoutsetinfo
+  }
+};
+
+// Testnet RPC Connection Settings
+const TESTNET_RPC_CONFIG = {
+  user: process.env.DGB_TESTNET_RPC_USER || 'user',
+  password: process.env.DGB_TESTNET_RPC_PASSWORD || 'password',
+  url: process.env.DGB_TESTNET_RPC_URL || 'http://127.0.0.1:14022',
+  timeout: {
+    default: 30000,
+    heavy: 120000
   }
 };
 
@@ -236,8 +247,109 @@ async function sendRpcRequest(method, params = [], skipCache = false) {
 }
 
 /**
+ * Enhanced RPC request function for Testnet with intelligent caching and rate limiting
+ *
+ * Features:
+ * - MD5-based cache keys for parameter-aware caching
+ * - Configurable cache TTL based on request type
+ * - Graceful degradation with stale cache fallback
+ * - Rate limiting to prevent node overload
+ *
+ * @param {string} method - RPC method name
+ * @param {Array} params - Parameters for the RPC call
+ * @param {boolean} skipCache - Force bypass cache for fresh data
+ * @returns {Promise<any>} RPC response data
+ */
+async function sendTestnetRpcRequest(method, params = [], skipCache = false) {
+  stats.totalRequests++;
+
+  try {
+    // Generate unique cache key based on method and parameters (with testnet prefix)
+    const cacheKey = 'testnet:' + generateCacheKey(method, params);
+
+    // Check cache first (unless explicitly skipped)
+    if (!skipCache) {
+      const cachedResult = rpcCache.get(cacheKey);
+      if (cachedResult !== undefined) {
+        stats.cacheHits++;
+        return cachedResult;
+      }
+    }
+
+    // Cache miss - need to make RPC call
+    stats.cacheMisses++;
+
+    // Apply rate limiting
+    await waitForAvailableSlot();
+
+    // Track this request
+    stats.pendingRequests++;
+
+    try {
+      // Configure timeout based on method type
+      const timeout = getTimeoutForMethod(method);
+
+      // Make the RPC call to testnet
+      const response = await axios.post(TESTNET_RPC_CONFIG.url, {
+        jsonrpc: '1.0',
+        id: 'dgb_testnet_rpc',
+        method: method,
+        params: params,
+      }, {
+        auth: {
+          username: TESTNET_RPC_CONFIG.user,
+          password: TESTNET_RPC_CONFIG.password,
+        },
+        timeout: timeout,
+      });
+
+      // Release the request slot
+      stats.pendingRequests--;
+
+      // Check for RPC errors
+      if (response.data.error) {
+        throw new Error(`Testnet RPC Error: ${JSON.stringify(response.data.error)}`);
+      }
+
+      const result = response.data.result;
+
+      // Cache the result with appropriate TTL
+      cacheResultWithSmartTTL(cacheKey, result, method);
+
+      return result;
+
+    } catch (requestError) {
+      // Always decrement pending requests on error
+      stats.pendingRequests--;
+      throw requestError;
+    }
+
+  } catch (error) {
+    console.error(`Testnet RPC Error (${method}):`, error.message);
+
+    // Special handling for known timeout issues
+    if (method === 'gettxoutsetinfo' && error.code === 'ECONNABORTED') {
+      console.log('Testnet gettxoutsetinfo timed out - this is normal for this heavy command');
+    }
+
+    // Try to return stale cached data as fallback
+    const staleResult = attemptStaleDataRecovery(method, params);
+    if (staleResult !== null) {
+      return staleResult;
+    }
+
+    // For critical methods, return estimated data rather than failing
+    if (method === 'gettxoutsetinfo') {
+      return generateEstimatedUTXOData();
+    }
+
+    return null;
+  }
+}
+
+/**
  * Generate a unique cache key based on method and parameters
- * 
+ *
  * @param {string} method - RPC method
  * @param {Array} params - Method parameters
  * @returns {string} MD5 hash cache key
@@ -881,12 +993,161 @@ router.post('/refreshcache', async (req, res) => {
 });
 
 // ============================================================================
+// TESTNET API ROUTES
+// ============================================================================
+
+// Testnet blockchain information
+router.get('/testnet/getblockchaininfo', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getblockchaininfo');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getblockchaininfo:', error);
+    res.status(500).json({ error: 'Error fetching testnet blockchain info' });
+  }
+});
+
+// Testnet block hash by height
+router.get('/testnet/getblockhash/:height', async (req, res) => {
+  try {
+    const height = parseInt(req.params.height, 10);
+    const data = await sendTestnetRpcRequest('getblockhash', [height]);
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getblockhash:', error);
+    res.status(500).json({ error: 'Error fetching testnet block hash' });
+  }
+});
+
+// Testnet block by hash
+router.get('/testnet/getblock/:hash', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getblock', [req.params.hash, 2]);
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getblock:', error);
+    res.status(500).json({ error: 'Error fetching testnet block' });
+  }
+});
+
+// Testnet chain transaction statistics
+router.get('/testnet/getchaintxstats', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getchaintxstats');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getchaintxstats:', error);
+    res.status(500).json({ error: 'Error fetching testnet chain transaction stats' });
+  }
+});
+
+// Testnet UTXO set information
+router.get('/testnet/gettxoutsetinfo', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('gettxoutsetinfo');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/gettxoutsetinfo:', error);
+    res.status(500).json({ error: 'Error fetching testnet transaction output set info' });
+  }
+});
+
+// Testnet peer information with geolocation data
+router.get('/testnet/getpeerinfo', async (req, res) => {
+  try {
+    const peerData = await sendTestnetRpcRequest('getpeerinfo');
+
+    // Enhance peer data with geolocation
+    const enhancedPeers = peerData.map((node) => {
+      const ip = node.addr.split(':')[0];
+      const geoData = geoip.lookup(ip) || {};
+
+      return {
+        ...node,
+        lat: geoData.ll && geoData.ll[0],
+        lon: geoData.ll && geoData.ll[1],
+        city: geoData.city,
+        country: geoData.country,
+      };
+    });
+
+    res.json(enhancedPeers);
+  } catch (error) {
+    console.error('Error in /api/testnet/getpeerinfo:', error);
+    res.status(500).json({ error: 'Error fetching testnet peer info' });
+  }
+});
+
+// Testnet current block reward
+router.get('/testnet/getblockreward', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getblockreward');
+    res.json({ blockReward: data });
+  } catch (error) {
+    console.error('Error in /api/testnet/getblockreward:', error);
+    res.status(500).json({ error: 'Error fetching testnet block reward' });
+  }
+});
+
+// Testnet mempool information
+router.get('/testnet/getmempoolinfo', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getmempoolinfo');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getmempoolinfo:', error);
+    res.status(500).json({ error: 'Error fetching testnet mempool info' });
+  }
+});
+
+// Testnet raw mempool data
+router.get('/testnet/getrawmempool', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getrawmempool', [true]);
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getrawmempool:', error);
+    res.status(500).json({ error: 'Error fetching testnet raw mempool' });
+  }
+});
+
+// Testnet latest block information
+router.get('/testnet/getlatestblock', async (req, res) => {
+  try {
+    const latestBlockHash = await sendTestnetRpcRequest('getbestblockhash');
+    if (!latestBlockHash) {
+      throw new Error('Failed to fetch testnet latest block hash');
+    }
+
+    const block = await sendTestnetRpcRequest('getblock', [latestBlockHash]);
+    if (!block) {
+      throw new Error('Failed to fetch testnet block data');
+    }
+
+    res.json({
+      height: block.height,
+      hash: block.hash,
+      algo: block.pow_algo,
+      txCount: block.nTx,
+      difficulty: block.difficulty,
+    });
+  } catch (error) {
+    console.error('Error fetching testnet latest block:', error);
+    res.status(500).json({
+      error: 'Error fetching testnet latest block',
+      details: error.message
+    });
+  }
+});
+
+// ============================================================================
 // MODULE EXPORTS
 // ============================================================================
 
 module.exports = {
   router,
   sendRpcRequest,
+  sendTestnetRpcRequest,
   getTransactionData,
   getAlgoName,
   getBlocksByTimeRange,
