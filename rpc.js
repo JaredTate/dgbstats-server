@@ -1173,17 +1173,46 @@ router.get('/testnet/getoracleprice', async (req, res) => {
 });
 
 /**
- * List all configured oracles and their status
- * Returns array of oracle info with pubkey, endpoint, and running status
+ * Get network-wide view of ALL oracles
+ * Returns array of oracle info with names, pubkeys, endpoints, prices, and status
+ * This is the primary endpoint for the oracle network page
  */
-router.get('/testnet/listoracles', async (req, res) => {
+router.get('/testnet/getoracles', async (req, res) => {
   try {
-    const activeOnly = req.query.active === 'true';
-    const data = await sendTestnetRpcRequest('listoracles', [activeOnly]);
+    const data = await sendTestnetRpcRequest('getoracles');
     res.json(data);
   } catch (error) {
-    console.error('Error in /api/testnet/listoracles:', error);
-    res.status(500).json({ error: 'Error fetching oracle list', details: error.message });
+    console.error('Error in /api/testnet/getoracles:', error);
+    res.status(500).json({ error: 'Error fetching oracles', details: error.message });
+  }
+});
+
+/**
+ * Get detailed per-oracle price breakdown (forensics view)
+ * Returns each oracle's exact price, deviation from median, signature validity
+ * Use this to catch anyone gaming the system
+ */
+router.get('/testnet/getalloracleprices', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getalloracleprices');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getalloracleprices:', error);
+    res.status(500).json({ error: 'Error fetching all oracle prices', details: error.message });
+  }
+});
+
+/**
+ * Get local oracle status (is your local oracle running?)
+ * Returns status of oracle running on THIS node
+ */
+router.get('/testnet/listoracle', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('listoracle');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/listoracle:', error);
+    res.status(500).json({ error: 'Error fetching local oracle status', details: error.message });
   }
 });
 
