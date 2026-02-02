@@ -37,6 +37,7 @@ const zmq = require('zeromq');
 const {
   router: rpcRoutes,
   sendRpcRequest,
+  sendTestnetRpcRequest,
   getTransactionData,
   getAlgoName,
   getBlocksByTimeRange
@@ -52,6 +53,7 @@ const config = require('./config.js');
 const SERVER_CONFIG = {
   port: process.env.PORT || 5001,
   wsPort: 5002,
+  testnetWsPort: process.env.DGB_TESTNET_WS_PORT || 5003,
   corsEnabled: true,
   maxRecentBlocks: 240,
   pingInterval: 30000  // 30 seconds WebSocket ping
@@ -69,6 +71,17 @@ const ZMQ_CONFIG = {
     rawblock: 'tcp://127.0.0.1:28332',   // Raw block data
     hashblock: 'tcp://127.0.0.1:28334'   // Block hashes
   }
+};
+
+// ============================================================================
+// TESTNET RPC CONFIGURATION
+// ============================================================================
+
+const TESTNET_RPC_CONFIG = {
+  user: process.env.DGB_TESTNET_RPC_USER || 'user',
+  password: process.env.DGB_TESTNET_RPC_PASSWORD || 'password',
+  url: process.env.DGB_TESTNET_RPC_URL || 'http://127.0.0.1:14022',
+  timeout: 30000
 };
 
 // ============================================================================
@@ -94,8 +107,14 @@ app.use('/api', rpcRoutes);
  */
 const wss = new WebSocket.Server({ port: SERVER_CONFIG.wsPort });
 
+/**
+ * Testnet WebSocket server for real-time testnet blockchain updates
+ */
+const wssTestnet = new WebSocket.Server({ port: SERVER_CONFIG.testnetWsPort });
+
 // Track connected clients for broadcasting
 let connectedClients = 0;
+let testnetConnectedClients = 0;
 
 // ============================================================================
 // DATA STORAGE AND CACHING
@@ -157,6 +176,52 @@ const peerCache = new NodeCache({ stdTTL: 600 }); // 10-minute peer cache
  * Ensures data availability even when RPC calls fail
  */
 let inMemoryInitialData = null;
+
+// ============================================================================
+// TESTNET DATA STORAGE
+// ============================================================================
+
+/**
+ * Testnet-specific data stores
+ * Kept separate from mainnet to avoid data mixing
+ */
+let testnetRecentBlocks = [];
+let testnetInMemoryInitialData = null;
+
+/**
+ * In-memory storage for recent confirmed testnet transactions
+ * Maintains the latest confirmed transactions for immediate delivery
+ */
+let testnetRecentTransactionsCache = [];
+
+/**
+ * In-memory storage for current testnet mempool state
+ * Maintains current mempool transactions and statistics for immediate delivery
+ */
+let testnetMempoolCache = {
+  stats: {
+    size: 0,
+    bytes: 0,
+    usage: 0,
+    maxmempool: 300000000,
+    minfee: 0,
+    avgfee: 0,
+    totalfee: 0,
+    feeDistribution: {
+      '0-10': 0,
+      '10-50': 0,
+      '50-100': 0,
+      '100-500': 0,
+      '500+': 0
+    }
+  },
+  transactions: []
+};
+
+/**
+ * Track testnet mempool transactions with timestamps for 3-minute retention
+ */
+const testnetMempoolTransactionHistory = new Map();
 
 // ============================================================================
 // DATABASE SETUP
@@ -283,10 +348,83 @@ wss.on('connection', (ws) => {
   });
 });
 
+// ============================================================================
+// TESTNET WEBSOCKET CONNECTION HANDLER
+// ============================================================================
+
+/**
+ * Testnet WebSocket connection handler
+ * Provides testnet-specific blockchain data to connected clients
+ */
+wssTestnet.on('connection', (ws) => {
+  console.log('Testnet WebSocket client connected');
+  testnetConnectedClients++;
+  console.log(`Active Testnet WebSocket connections: ${testnetConnectedClients}`);
+
+  // Send recent testnet blocks immediately
+  console.log(`Sending ${testnetRecentBlocks.length} recent testnet blocks to new client`);
+  ws.send(JSON.stringify({
+    type: 'recentBlocks',
+    data: testnetRecentBlocks
+  }));
+
+  // Send cached testnet confirmed transactions immediately
+  console.log(`Sending ${testnetRecentTransactionsCache.length} cached testnet confirmed transactions to new client`);
+  ws.send(JSON.stringify({
+    type: 'recentTransactions',
+    data: testnetRecentTransactionsCache
+  }));
+
+  // Send cached testnet mempool data immediately
+  console.log(`Sending cached testnet mempool data (${testnetMempoolCache.transactions.length} transactions) to new client`);
+  ws.send(JSON.stringify({
+    type: 'mempool',
+    data: testnetMempoolCache
+  }));
+
+  // Send cached testnet initial data
+  sendTestnetInitialDataToClient(ws);
+
+  // Setup connection heartbeat
+  const pingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  }, SERVER_CONFIG.pingInterval);
+
+  // Handle client disconnection
+  ws.on('close', () => {
+    console.log('Testnet WebSocket client disconnected');
+    testnetConnectedClients--;
+    clearInterval(pingTimer);
+  });
+
+  // Handle connection errors
+  ws.on('error', (error) => {
+    console.error('Testnet WebSocket error:', error);
+    testnetConnectedClients--;
+    clearInterval(pingTimer);
+  });
+});
+
+/**
+ * Send testnet initial blockchain data to a specific client
+ *
+ * @param {WebSocket} ws - WebSocket connection
+ */
+function sendTestnetInitialDataToClient(ws) {
+  if (testnetInMemoryInitialData) {
+    ws.send(JSON.stringify({
+      type: 'initialData',
+      data: testnetInMemoryInitialData
+    }));
+  }
+}
+
 /**
  * Send initial blockchain data to a specific client
  * Uses in-memory cache first, falls back to NodeCache
- * 
+ *
  * @param {WebSocket} ws - WebSocket connection
  */
 function sendInitialDataToClient(ws) {
@@ -906,6 +1044,72 @@ function broadcastNewBlock(newBlock) {
 }
 
 // ============================================================================
+// TESTNET BLOCK NOTIFICATION HANDLING
+// ============================================================================
+
+/**
+ * Handle new testnet block notifications from the DigiByte testnet daemon
+ *
+ * This endpoint is called by the testnet blocknotify script when a new block
+ * is found. It processes the block and broadcasts it to all connected
+ * testnet WebSocket clients for real-time updates.
+ */
+app.post('/api/testnet/blocknotify', async (req, res) => {
+  try {
+    // Validate request
+    if (!req.body?.blockhash) {
+      throw new Error('Missing blockhash in request body');
+    }
+
+    const blockHash = req.body.blockhash;
+    console.log(`Testnet: New block notification: ${blockHash}`);
+
+    // Fetch complete block data
+    const fullBlock = await sendTestnetRpcRequest('getblock', [blockHash, 2]);
+    if (!fullBlock || !fullBlock.tx?.[0]) {
+      console.log('Testnet: Invalid block data received, skipping notification');
+      return res.sendStatus(200);
+    }
+
+    // Extract mining information
+    const coinbaseTx = fullBlock.tx[0];
+    const addressOutput = coinbaseTx.vout?.find(output => output?.scriptPubKey?.address);
+    const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
+
+    const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
+    const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
+
+    // Create standardized block object
+    const newBlock = {
+      height: fullBlock.height,
+      hash: fullBlock.hash,
+      algo: getAlgoName(fullBlock.pow_algo),
+      txCount: fullBlock.nTx,
+      difficulty: fullBlock.difficulty,
+      timestamp: fullBlock.time,
+      minedTo: minerAddress,
+      minerAddress,
+      poolIdentifier,
+      taprootSignaling,
+      version: fullBlock.version
+    };
+
+    // Update testnet recent blocks cache
+    updateTestnetRecentBlocksCache(newBlock);
+
+    // Broadcast to all connected testnet WebSocket clients
+    broadcastTestnetNewBlock(newBlock);
+
+    console.log(`Testnet: Block ${newBlock.height} processed and broadcast to ${testnetConnectedClients} clients`);
+    res.sendStatus(200);
+
+  } catch (error) {
+    console.error('Testnet: Block notification processing error:', error);
+    res.sendStatus(500);
+  }
+});
+
+// ============================================================================
 // INITIAL DATA MANAGEMENT
 // ============================================================================
 
@@ -934,16 +1138,26 @@ async function fetchInitialData() {
     // Get current block reward
     const blockRewardResponse = await sendRpcRequest('getblockreward');
     const blockReward = parseFloat(blockRewardResponse?.blockreward || '0');
-    
+
+    // Get deployment info (softforks) - replaces deprecated softforks in getblockchaininfo
+    let deploymentInfo = null;
+    try {
+      deploymentInfo = await sendRpcRequest('getdeploymentinfo');
+      console.log('Deployment info loaded:', Object.keys(deploymentInfo?.deployments || {}).length, 'deployments');
+    } catch (e) {
+      console.log('getdeploymentinfo failed:', e.message);
+    }
+
     // Attempt to get UTXO set info (may timeout)
     let txOutsetInfo = await fetchUTXOSetInfo(blockchainInfo);
-    
+
     // Prepare complete data package
     const initialData = {
       blockchainInfo,
       chainTxStats,
       txOutsetInfo,
-      blockReward
+      blockReward,
+      deploymentInfo
     };
 
     // Cache in multiple locations for redundancy
@@ -962,6 +1176,228 @@ async function fetchInitialData() {
     // Return existing in-memory data rather than failing completely
     return inMemoryInitialData;
   }
+}
+
+/**
+ * Fetch and cache essential TESTNET blockchain data
+ * Similar to fetchInitialData but uses testnet RPC
+ */
+async function fetchTestnetInitialData() {
+  try {
+    console.log('Fetching testnet initial data...');
+
+    // Get core blockchain information
+    const blockchainInfo = await sendTestnetRpcRequest('getblockchaininfo');
+    if (!blockchainInfo) {
+      console.log('Testnet: Unable to fetch blockchain info (testnet may be offline)');
+      return null;
+    }
+
+    // Get transaction statistics
+    const chainTxStats = await sendTestnetRpcRequest('getchaintxstats');
+
+    // Get current block reward
+    const blockRewardResponse = await sendTestnetRpcRequest('getblockreward');
+    const blockReward = parseFloat(blockRewardResponse?.blockreward || '0');
+
+    // Get UTXO set info
+    let txOutsetInfo = null;
+    try {
+      txOutsetInfo = await sendTestnetRpcRequest('gettxoutsetinfo');
+    } catch (e) {
+      console.log('Testnet: gettxoutsetinfo failed, using estimated data');
+      txOutsetInfo = { total_amount: 0, _estimated: true };
+    }
+
+    // Get deployment info (softforks) - replaces deprecated softforks in getblockchaininfo
+    let deploymentInfo = null;
+    try {
+      deploymentInfo = await sendTestnetRpcRequest('getdeploymentinfo');
+      console.log('Testnet deployment info loaded:', Object.keys(deploymentInfo?.deployments || {}).length, 'deployments');
+    } catch (e) {
+      console.log('Testnet: getdeploymentinfo failed:', e.message);
+    }
+
+    // Prepare complete data package
+    const initialData = {
+      blockchainInfo,
+      chainTxStats,
+      txOutsetInfo,
+      blockReward,
+      deploymentInfo
+    };
+
+    // Store in memory
+    testnetInMemoryInitialData = initialData;
+
+    // Broadcast to testnet WebSocket clients
+    broadcastTestnetInitialData(initialData);
+
+    console.log(`Testnet initial data loaded: height=${blockchainInfo.blocks}`);
+    return initialData;
+
+  } catch (error) {
+    console.error('Error fetching testnet initial data:', error.message);
+    return testnetInMemoryInitialData;
+  }
+}
+
+/**
+ * Broadcast initial data to all connected testnet WebSocket clients
+ */
+function broadcastTestnetInitialData(initialData) {
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({
+        type: 'initialData',
+        data: initialData
+      }));
+    }
+  });
+}
+
+// ============================================================================
+// TESTNET BLOCK FETCHING AND CACHING
+// ============================================================================
+
+/**
+ * Fetch and maintain the most recent testnet blocks for real-time display
+ *
+ * This function ensures we always have the latest testnet blocks available for
+ * immediate WebSocket delivery to new clients.
+ *
+ * @returns {Promise<Array>} Array of recent testnet block objects
+ */
+async function fetchTestnetLatestBlocks() {
+  try {
+    console.log('Refreshing testnet recent blocks cache...');
+
+    // Get current testnet blockchain tip
+    const blockchainInfo = await sendTestnetRpcRequest('getblockchaininfo');
+    if (!blockchainInfo) {
+      console.log('Testnet: Unable to fetch blockchain info (testnet may be offline)');
+      return testnetRecentBlocks;
+    }
+
+    const latestBlockHeight = blockchainInfo.blocks;
+    console.log(`Testnet current blockchain height: ${latestBlockHeight}`);
+
+    // Clear existing blocks to prevent duplicates
+    testnetRecentBlocks.length = 0;
+
+    // Fetch blocks individually for testnet (simpler approach)
+    const blocksToFetch = Math.min(SERVER_CONFIG.maxRecentBlocks, latestBlockHeight);
+
+    for (let i = 0; i < blocksToFetch; i++) {
+      const height = latestBlockHeight - i;
+      try {
+        const blockData = await fetchSingleTestnetBlockForCache(height);
+        if (blockData) {
+          testnetRecentBlocks.push(blockData);
+        }
+      } catch (error) {
+        console.error(`Testnet: Error fetching block at height ${height}:`, error.message);
+      }
+    }
+
+    // Sort by height descending
+    testnetRecentBlocks.sort((a, b) => b.height - a.height);
+
+    console.log(`Testnet block cache updated: ${testnetRecentBlocks.length} blocks loaded`);
+    if (testnetRecentBlocks.length > 0) {
+      console.log(`Testnet height range: ${testnetRecentBlocks[0]?.height || 'none'} to ${testnetRecentBlocks[testnetRecentBlocks.length-1]?.height || 'none'}`);
+    }
+
+    return testnetRecentBlocks;
+  } catch (error) {
+    console.error('Testnet: Error fetching latest blocks:', error);
+    return testnetRecentBlocks;
+  }
+}
+
+/**
+ * Fetch and process a single testnet block for the cache
+ *
+ * @param {number} height - Block height to fetch
+ * @returns {Promise<object|null>} Processed block data or null
+ */
+async function fetchSingleTestnetBlockForCache(height) {
+  // Get block hash
+  const hash = await sendTestnetRpcRequest('getblockhash', [height]);
+  if (!hash) return null;
+
+  // Get full block data
+  const block = await sendTestnetRpcRequest('getblock', [hash, 2]);
+  if (!block || !block.tx || block.tx.length === 0) return null;
+
+  // Process mining information
+  const coinbaseTx = block.tx[0];
+  const addressOutput = coinbaseTx.vout?.find(output => output?.scriptPubKey?.address);
+  const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
+
+  const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
+  const taprootSignaling = (block.version & (1 << 2)) !== 0;
+
+  return {
+    height: block.height,
+    hash: block.hash,
+    algo: getAlgoName(block.pow_algo),
+    txCount: block.nTx,
+    difficulty: block.difficulty,
+    timestamp: block.time,
+    minedTo: minerAddress,
+    minerAddress,
+    poolIdentifier,
+    taprootSignaling,
+    version: block.version
+  };
+}
+
+/**
+ * Update the testnet recent blocks cache with a new block
+ *
+ * @param {object} newBlock - New block data
+ */
+function updateTestnetRecentBlocksCache(newBlock) {
+  // Check if block already exists
+  const existingIndex = testnetRecentBlocks.findIndex(b => b.height === newBlock.height);
+  if (existingIndex !== -1) {
+    // Replace existing block
+    testnetRecentBlocks[existingIndex] = newBlock;
+  } else {
+    // Add to front of array
+    testnetRecentBlocks.unshift(newBlock);
+  }
+
+  // Sort by height to ensure proper ordering
+  testnetRecentBlocks.sort((a, b) => b.height - a.height);
+
+  // Maintain maximum size
+  testnetRecentBlocks.splice(SERVER_CONFIG.maxRecentBlocks);
+}
+
+/**
+ * Broadcast new testnet block to all connected testnet WebSocket clients
+ *
+ * @param {object} newBlock - New block data
+ */
+function broadcastTestnetNewBlock(newBlock) {
+  const message = JSON.stringify({
+    type: 'newBlock',
+    data: newBlock
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting to testnet WebSocket client:', error);
+      }
+    }
+  });
+
+  console.log(`Testnet: New block ${newBlock.height} broadcast to ${wssTestnet.clients.size} clients`);
 }
 
 /**
@@ -1574,6 +2010,384 @@ async function updateMempoolCache() {
   }
 }
 
+// ============================================================================
+// TESTNET TRANSACTION CACHE FUNCTIONS
+// ============================================================================
+
+/**
+ * Update the cached testnet confirmed transactions
+ * This function populates the testnetRecentTransactionsCache for immediate delivery
+ */
+async function updateTestnetConfirmedTransactionsCache() {
+  const { sendTestnetRpcRequest } = require('./rpc');
+
+  try {
+    console.log('🔄 Updating testnet confirmed transactions cache...');
+    console.log(`   Testnet recent blocks available: ${testnetRecentBlocks.length}`);
+
+    const transactions = [];
+    const maxBlocksToCheck = 50; // Check up to 50 blocks to find transactions
+    const blocksToCheck = Math.min(maxBlocksToCheck, testnetRecentBlocks.length);
+
+    let totalTxsFound = 0;
+    let blocksWithTxs = 0;
+
+    for (let i = 0; i < blocksToCheck && transactions.length < 15; i++) {
+      const block = testnetRecentBlocks[i];
+      if (!block || !block.hash) {
+        console.log(`   Testnet block ${i} is invalid, skipping...`);
+        continue;
+      }
+
+      try {
+        const fullBlock = await sendTestnetRpcRequest('getblock', [block.hash, 2]);
+        if (!fullBlock || !fullBlock.tx) {
+          console.log(`   ⚠️  Testnet block ${block.height} - Failed to get block data`);
+          continue;
+        }
+
+        const nonCoinbaseTxs = fullBlock.tx.length - 1;
+        totalTxsFound += nonCoinbaseTxs;
+
+        if (nonCoinbaseTxs > 0) {
+          blocksWithTxs++;
+          console.log(`   📦 Testnet block ${fullBlock.height}: ${nonCoinbaseTxs} non-coinbase transactions`);
+        } else {
+          console.log(`   📦 Testnet block ${fullBlock.height}: Only coinbase transaction (empty block)`);
+          continue;
+        }
+
+        // Process all non-coinbase transactions (skip index 0 which is coinbase)
+        for (let j = 1; j < fullBlock.tx.length && transactions.length < 15; j++) {
+          const tx = fullBlock.tx[j];
+          if (!tx || !tx.txid) {
+            console.log(`      ⚠️  Testnet transaction ${j} in block ${fullBlock.height} is invalid`);
+            continue;
+          }
+
+          try {
+            let totalValue = 0;
+            let inputs = [];
+            let outputs = [];
+
+            if (tx.vout && Array.isArray(tx.vout)) {
+              for (const output of tx.vout) {
+                if (output.value) {
+                  totalValue += output.value;
+                  outputs.push({
+                    address: output.scriptPubKey?.address || 'Unknown',
+                    amount: output.value,
+                    type: output.scriptPubKey?.type || ''
+                  });
+                }
+              }
+            }
+
+            if (tx.vin && Array.isArray(tx.vin)) {
+              inputs = tx.vin.map(input => ({
+                txid: input.txid || '',
+                vout: input.vout !== undefined ? input.vout : -1,
+                address: '',
+                amount: 0
+              }));
+            }
+
+            // More realistic fee estimation based on transaction size
+            const txSize = tx.vsize || tx.size || (inputs.length * 148 + outputs.length * 34 + 10);
+            const estimatedFee = Math.max(0.00001, txSize * 0.00000050); // ~50 sat/byte
+            const feeRate = Math.round((estimatedFee * 100000000) / txSize);
+
+            let priority = 'low';
+            if (feeRate > 100) priority = 'high';
+            else if (feeRate > 50) priority = 'medium';
+
+            const confirmations = testnetRecentBlocks[0] ? (testnetRecentBlocks[0].height - fullBlock.height + 1) : 1;
+
+            const txData = {
+              txid: tx.txid,
+              blockHeight: fullBlock.height,
+              blockHash: fullBlock.hash,
+              blocktime: fullBlock.time,
+              time: fullBlock.time,
+              value: totalValue,
+              size: txSize,
+              vsize: tx.vsize || txSize,
+              fee: estimatedFee,
+              fee_rate: feeRate,
+              priority: priority,
+              inputs: inputs,
+              outputs: outputs,
+              confirmations: confirmations
+            };
+
+            transactions.push(txData);
+            console.log(`      ✅ Processed testnet tx ${tx.txid.substring(0, 8)}... value: ${totalValue.toFixed(4)} DGB, ${inputs.length} inputs, ${outputs.length} outputs`);
+
+          } catch (txError) {
+            console.error(`Error processing testnet transaction ${tx.txid}:`, txError.message);
+          }
+        }
+
+      } catch (blockError) {
+        console.error(`Error processing testnet block ${block.hash}:`, blockError.message);
+      }
+    }
+
+    // Summary of search results
+    console.log(`   📊 Testnet Search Summary:`);
+    console.log(`      Blocks checked: ${blocksToCheck}`);
+    console.log(`      Blocks with transactions: ${blocksWithTxs}`);
+    console.log(`      Total transactions found: ${totalTxsFound}`);
+    console.log(`      Transactions processed: ${transactions.length}`);
+
+    transactions.sort((a, b) => {
+      if (a.blockHeight !== b.blockHeight) {
+        return b.blockHeight - a.blockHeight;
+      }
+      return b.time - a.time;
+    });
+
+    testnetRecentTransactionsCache = transactions.slice(0, 10);
+    console.log(`✅ Testnet confirmed transactions cache updated: ${testnetRecentTransactionsCache.length} transactions`);
+
+    if (testnetRecentTransactionsCache.length > 0) {
+      console.log(`   Latest: ${testnetRecentTransactionsCache[0].txid.substring(0, 8)}... (Block ${testnetRecentTransactionsCache[0].blockHeight})`);
+      console.log(`   Value: ${testnetRecentTransactionsCache[0].value.toFixed(8)} DGB`);
+
+      // Broadcast updated confirmed transactions to all testnet clients
+      broadcastTestnetRecentTransactions();
+    } else {
+      console.log(`   ⚠️  No confirmed testnet transactions found in last ${blocksToCheck} blocks`);
+      console.log(`   💡 This could mean:`);
+      console.log(`      - Recent testnet blocks only contain coinbase transactions`);
+      console.log(`      - Testnet has low transaction volume`);
+      console.log(`      - RPC connection issues`);
+    }
+
+  } catch (error) {
+    console.error('❌ Error updating testnet confirmed transactions cache:', error);
+    // Keep existing cache on error
+  }
+}
+
+/**
+ * Update the cached testnet mempool state
+ * This function populates the testnetMempoolCache for immediate delivery
+ */
+async function updateTestnetMempoolCache() {
+  const { sendTestnetRpcRequest } = require('./rpc');
+
+  try {
+    console.log('🔄 Updating testnet mempool cache...');
+
+    const mempoolInfo = await sendTestnetRpcRequest('getmempoolinfo');
+    const rawMempool = await sendTestnetRpcRequest('getrawmempool', [true]);
+
+    console.log(`   📊 Testnet mempool info: ${mempoolInfo?.size || 0} transactions, ${((mempoolInfo?.bytes || 0) / 1048576).toFixed(2)} MB`);
+
+    const transactions = [];
+    const txIds = Object.keys(rawMempool || {});
+    let totalFee = 0;
+    const feeDistribution = {
+      '0-10': 0,
+      '10-50': 0,
+      '50-100': 0,
+      '100-500': 0,
+      '500+': 0
+    };
+
+    for (const txid of txIds.slice(0, 50)) {
+      const txData = rawMempool[txid];
+      if (!txData) continue;
+
+      try {
+        // Get enhanced transaction data for testnet
+        let enhancedTxData = null;
+        try {
+          enhancedTxData = await sendTestnetRpcRequest('getrawtransaction', [txid, true]);
+        } catch (e) {
+          // Transaction may have been confirmed or dropped
+        }
+
+        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+
+        if (feeRate < 10) feeDistribution['0-10']++;
+        else if (feeRate < 50) feeDistribution['10-50']++;
+        else if (feeRate < 100) feeDistribution['50-100']++;
+        else if (feeRate < 500) feeDistribution['100-500']++;
+        else feeDistribution['500+']++;
+
+        let priority = 'low';
+        if (feeRate > 100) priority = 'high';
+        else if (feeRate > 50) priority = 'medium';
+
+        let totalValue = 0;
+        let inputs = [];
+        let outputs = [];
+
+        if (enhancedTxData && enhancedTxData.vout && Array.isArray(enhancedTxData.vout)) {
+          for (const output of enhancedTxData.vout) {
+            if (output.value) {
+              totalValue += output.value;
+              outputs.push({
+                address: output.scriptPubKey?.address || '',
+                amount: output.value,
+                type: output.scriptPubKey?.type || ''
+              });
+            }
+          }
+
+          if (enhancedTxData.vin && Array.isArray(enhancedTxData.vin)) {
+            inputs = enhancedTxData.vin.map(input => ({
+              txid: input.txid || '',
+              vout: input.vout || 0,
+              address: '',
+              amount: 0
+            }));
+          }
+        }
+
+        totalFee += txData.fee || 0;
+
+        transactions.push({
+          txid: txid,
+          size: txData.vsize || txData.size || 0,
+          vsize: txData.vsize || txData.size || 0,
+          fee: txData.fee || 0,
+          value: Math.abs(totalValue),
+          time: txData.time || Math.floor(Date.now() / 1000),
+          inputs: inputs,
+          outputs: outputs,
+          fee_rate: feeRate,
+          priority: priority,
+          confirmations: 0,
+          descendantcount: txData.descendantcount || 0,
+          descendantsize: txData.descendantsize || 0,
+          ancestorcount: txData.ancestorcount || 0,
+          ancestorsize: txData.ancestorsize || 0
+        });
+
+      } catch (txError) {
+        console.error(`Error processing testnet mempool transaction ${txid}:`, txError.message);
+      }
+    }
+
+    // Update transaction history for 3-minute retention
+    const currentTime = Date.now();
+    const currentTxIds = new Set(txIds);
+
+    // Mark removed transactions
+    for (const [txid, history] of testnetMempoolTransactionHistory.entries()) {
+      if (!currentTxIds.has(txid) && !history.removedAt) {
+        history.removedAt = currentTime;
+        console.log(`   📤 Testnet transaction ${txid.substring(0, 8)}... left mempool`);
+      }
+    }
+
+    // Add new transactions to history
+    transactions.forEach(tx => {
+      if (!testnetMempoolTransactionHistory.has(tx.txid)) {
+        testnetMempoolTransactionHistory.set(tx.txid, {
+          transaction: tx,
+          addedAt: currentTime,
+          removedAt: null
+        });
+        console.log(`   📥 New testnet transaction ${tx.txid.substring(0, 8)}... added to history`);
+      }
+    });
+
+    // Clean up transactions older than 3 minutes
+    const threeMinutesAgo = currentTime - (3 * 60 * 1000);
+    for (const [txid, history] of testnetMempoolTransactionHistory.entries()) {
+      if (history.removedAt && history.removedAt < threeMinutesAgo) {
+        testnetMempoolTransactionHistory.delete(txid);
+        console.log(`   🗑️  Testnet transaction ${txid.substring(0, 8)}... removed from history (>3 min old)`);
+      }
+    }
+
+    // Include recent transactions in the displayed list
+    const displayTransactions = [];
+    for (const [txid, history] of testnetMempoolTransactionHistory.entries()) {
+      if (!history.removedAt || (currentTime - history.removedAt) < 3 * 60 * 1000) {
+        displayTransactions.push({
+          ...history.transaction,
+          inMempool: !history.removedAt,
+          removedAt: history.removedAt
+        });
+      }
+    }
+
+    displayTransactions.sort((a, b) => b.time - a.time);
+
+    const avgFee = transactions.length > 0
+      ? transactions.reduce((sum, tx) => sum + tx.fee, 0) / transactions.length
+      : 0;
+
+    testnetMempoolCache = {
+      stats: {
+        size: mempoolInfo?.size || 0,
+        bytes: mempoolInfo?.bytes || 0,
+        usage: mempoolInfo?.usage || 0,
+        maxmempool: mempoolInfo?.maxmempool || 300000000,
+        minfee: mempoolInfo?.mempoolminfee || mempoolInfo?.minrelaytxfee || 0.00001,
+        avgfee: avgFee,
+        totalfee: totalFee,
+        feeDistribution: feeDistribution
+      },
+      transactions: displayTransactions
+    };
+
+    console.log(`✅ Testnet mempool cache updated: ${transactions.length} active, ${displayTransactions.length} total (with history)`);
+
+    // Broadcast updated mempool to all testnet clients
+    broadcastTestnetMempool();
+
+  } catch (error) {
+    console.error('❌ Error updating testnet mempool cache:', error);
+    // Keep existing cache on error
+  }
+}
+
+/**
+ * Broadcast recent transactions to all connected testnet WebSocket clients
+ */
+function broadcastTestnetRecentTransactions() {
+  const message = JSON.stringify({
+    type: 'recentTransactions',
+    data: testnetRecentTransactionsCache
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting testnet confirmed transactions:', error);
+      }
+    }
+  });
+}
+
+/**
+ * Broadcast mempool data to all connected testnet WebSocket clients
+ */
+function broadcastTestnetMempool() {
+  const message = JSON.stringify({
+    type: 'mempool',
+    data: testnetMempoolCache
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting testnet mempool:', error);
+      }
+    }
+  });
+}
+
 /**
  * Fetch and send recent confirmed transactions to a specific client
  * DEPRECATED: Now using cached data sent immediately on connection
@@ -1582,10 +2396,10 @@ async function updateMempoolCache() {
 async function sendRecentTransactionsToClient(ws) {
   try {
     console.log('Fetching 10 most recent confirmed transactions...');
-    
+
     const transactions = [];
     const blocksToCheck = Math.min(3, recentBlocks.length); // Check last 3 blocks only
-    
+
     for (let i = 0; i < blocksToCheck && transactions.length < 10; i++) {
       const block = recentBlocks[i];
       if (!block || !block.hash) continue;
@@ -2429,20 +3243,25 @@ async function startServer() {
     const server = app.listen(SERVER_CONFIG.port, () => {
       console.log(`✓ HTTP server listening on port ${SERVER_CONFIG.port}`);
       console.log(`✓ WebSocket server listening on port ${SERVER_CONFIG.wsPort}`);
+      console.log(`✓ Testnet WebSocket server listening on port ${SERVER_CONFIG.testnetWsPort}`);
     });
 
     // Phase 2: Initialize essential blockchain data
     console.log('\nPhase 2: Loading essential blockchain data...');
     await Promise.all([
       fetchLatestBlocks().then(() => console.log('✓ Recent blocks loaded')),
-      fetchInitialData().then(() => console.log('✓ Initial blockchain data cached'))
+      fetchInitialData().then(() => console.log('✓ Initial blockchain data cached')),
+      fetchTestnetInitialData().then(() => console.log('✓ Testnet initial data cached')),
+      fetchTestnetLatestBlocks().then(() => console.log('✓ Testnet recent blocks loaded'))
     ]);
 
     // Phase 2.5: Initialize transaction caches for instant TxsPage loading
     console.log('\nPhase 2.5: Loading transaction caches...');
     await Promise.all([
       updateConfirmedTransactionsCache().then(() => console.log('✓ Confirmed transactions cache loaded')),
-      updateMempoolCache().then(() => console.log('✓ Mempool cache loaded'))
+      updateMempoolCache().then(() => console.log('✓ Mempool cache loaded')),
+      updateTestnetConfirmedTransactionsCache().then(() => console.log('✓ Testnet confirmed transactions cache loaded')),
+      updateTestnetMempoolCache().then(() => console.log('✓ Testnet mempool cache loaded'))
     ]);
 
     // Phase 3: Load peer network data
@@ -2470,26 +3289,48 @@ async function startServer() {
     
     // Blockchain data updates (every minute)
     setInterval(() => {
-      fetchLatestBlocks().catch(err => 
+      fetchLatestBlocks().catch(err =>
         console.error('Scheduled blocks update failed:', err));
     }, 60000);
-    
+
     setInterval(() => {
-      fetchInitialData().catch(err => 
+      fetchInitialData().catch(err =>
         console.error('Scheduled data update failed:', err));
+    }, 60000);
+
+    // Testnet blockchain data updates (every 60 seconds)
+    setInterval(() => {
+      fetchTestnetLatestBlocks().catch(err =>
+        console.error('Scheduled testnet blocks update failed:', err));
+    }, 60000);
+
+    setInterval(() => {
+      fetchTestnetInitialData().catch(err =>
+        console.error('Scheduled testnet data update failed:', err));
     }, 60000);
     
     // Transaction cache updates (every 30 seconds for responsiveness)
     setInterval(() => {
-      updateConfirmedTransactionsCache().catch(err => 
+      updateConfirmedTransactionsCache().catch(err =>
         console.error('Scheduled confirmed transactions cache update failed:', err));
     }, 30000);
-    
+
     setInterval(() => {
-      updateMempoolCache().catch(err => 
+      updateMempoolCache().catch(err =>
         console.error('Scheduled mempool cache update failed:', err));
     }, 30000);
-    
+
+    // Testnet transaction cache updates (every 30 seconds)
+    setInterval(() => {
+      updateTestnetConfirmedTransactionsCache().catch(err =>
+        console.error('Scheduled testnet confirmed transactions cache update failed:', err));
+    }, 30000);
+
+    setInterval(() => {
+      updateTestnetMempoolCache().catch(err =>
+        console.error('Scheduled testnet mempool cache update failed:', err));
+    }, 30000);
+
     // Peer data updates (every 10 minutes)
     setInterval(() => {
       refreshPeerData().catch(err => 
