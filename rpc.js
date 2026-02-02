@@ -1141,6 +1141,67 @@ router.get('/testnet/getlatestblock', async (req, res) => {
 });
 
 // ============================================================================
+// DIGIDOLLAR API ENDPOINTS (TESTNET ONLY)
+// ============================================================================
+
+/**
+ * Get DigiDollar system-wide statistics
+ * Returns health, collateral, supply, and tier information
+ */
+router.get('/testnet/getdigidollarstats', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getdigidollarstats');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getdigidollarstats:', error);
+    res.status(500).json({ error: 'Error fetching DigiDollar stats', details: error.message });
+  }
+});
+
+/**
+ * Get current oracle price data
+ * Returns price in micro-USD format and status
+ */
+router.get('/testnet/getoracleprice', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getoracleprice');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getoracleprice:', error);
+    res.status(500).json({ error: 'Error fetching oracle price', details: error.message });
+  }
+});
+
+/**
+ * List all configured oracles and their status
+ * Returns array of oracle info with pubkey, endpoint, and running status
+ */
+router.get('/testnet/listoracles', async (req, res) => {
+  try {
+    const activeOnly = req.query.active === 'true';
+    const data = await sendTestnetRpcRequest('listoracles', [activeOnly]);
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/listoracles:', error);
+    res.status(500).json({ error: 'Error fetching oracle list', details: error.message });
+  }
+});
+
+/**
+ * Get DigiDollar protection system status
+ * Returns DCA, ERR, and volatility protection status
+ */
+router.get('/testnet/getprotectionstatus', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getprotectionstatus');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getprotectionstatus:', error);
+    res.status(500).json({ error: 'Error fetching protection status', details: error.message });
+  }
+});
+
+// ============================================================================
 // MODULE EXPORTS
 // ============================================================================
 
