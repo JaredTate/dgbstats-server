@@ -385,6 +385,15 @@ wssTestnet.on('connection', (ws) => {
   // Send cached testnet initial data
   sendTestnetInitialDataToClient(ws);
 
+  // Send node geo data (shared with mainnet - nodes serve both networks)
+  if (uniqueNodes.length > 0) {
+    console.log(`Sending ${uniqueNodes.length} geo nodes to testnet client`);
+    ws.send(JSON.stringify({
+      type: 'geoData',
+      data: uniqueNodes
+    }));
+  }
+
   // Setup connection heartbeat
   const pingTimer = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
