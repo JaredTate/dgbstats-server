@@ -267,6 +267,7 @@ function initializeDatabase() {
  * Global state variables for tracking network nodes and connections
  */
 let uniqueNodes = [];
+let testnetUniqueNodes = [];
 
 // ============================================================================
 // WEBSOCKET CONNECTION MANAGEMENT
@@ -385,12 +386,12 @@ wssTestnet.on('connection', (ws) => {
   // Send cached testnet initial data
   sendTestnetInitialDataToClient(ws);
 
-  // Send node geo data (shared with mainnet - nodes serve both networks)
-  if (uniqueNodes.length > 0) {
-    console.log(`Sending ${uniqueNodes.length} geo nodes to testnet client`);
+  // Send testnet-specific node geo data
+  if (testnetUniqueNodes.length > 0) {
+    console.log(`Sending ${testnetUniqueNodes.length} testnet geo nodes to client`);
     ws.send(JSON.stringify({
       type: 'geoData',
-      data: uniqueNodes
+      data: testnetUniqueNodes
     }));
   }
 
@@ -1668,6 +1669,170 @@ function broadcastGeoData(geoNodes) {
       }
     }
   });
+}
+
+// ============================================================================
+// TESTNET PEER NETWORK MONITORING
+// ============================================================================
+
+/**
+ * Endpoint to fetch and process testnet peer network data
+ *
+ * This endpoint parses the testnet peers.dat file to extract unique IP addresses,
+ * enhances them with geolocation data, and stores them separately from mainnet.
+ */
+app.get('/api/testnet/getpeers', (req, res) => {
+  // Check for cached testnet peer data first
+  const cachedPeers = peerCache.get('testnetPeerData');
+  if (cachedPeers) {
+    const timeRemaining = Math.floor((peerCache.getTtl('testnetPeerData') - Date.now()) / 1000);
+    console.log(`Testnet: Serving cached peer data (expires in ${timeRemaining}s)`);
+    return res.json(cachedPeers);
+  }
+
+  console.log('Testnet: Cache miss - fetching fresh peer data...');
+
+  // Execute Python script to parse testnet peers.dat file
+  const pythonScriptPath = path.join(__dirname, 'parse_testnet_peers.py');
+  exec(`python3 ${pythonScriptPath}`, { timeout: 30000 }, (error, stdout, stderr) => {
+    if (error) {
+      console.error(`Testnet: Python script execution error: ${error.message}`);
+      return res.status(500).json({ error: 'Error executing testnet peer analysis script' });
+    }
+
+    if (stderr) {
+      console.error(`Testnet: Python script stderr: ${stderr}`);
+    }
+
+    // Parse and validate script output
+    try {
+      if (!stdout || stdout.trim() === '') {
+        return res.status(500).json({ error: 'Empty response from testnet peer analysis script' });
+      }
+
+      const peerData = JSON.parse(stdout);
+
+      if (!peerData.uniqueIPv4Addresses || !peerData.uniqueIPv6Addresses) {
+        return res.status(500).json({ error: 'Invalid testnet peer data format' });
+      }
+
+      const ipv4Count = peerData.uniqueIPv4Addresses.length;
+      const ipv6Count = peerData.uniqueIPv6Addresses.length;
+      console.log(`Testnet: Parsed peer data: ${ipv4Count} IPv4, ${ipv6Count} IPv6 addresses`);
+
+      // Process peer data with geolocation
+      processTestnetPeerGeolocation(peerData, res);
+
+    } catch (parseError) {
+      console.error(`Testnet: Error parsing peer script output: ${parseError.message}`);
+      return res.status(500).json({ error: 'Error parsing testnet peer analysis results' });
+    }
+  });
+});
+
+/**
+ * Process testnet peer IP addresses with geolocation data
+ */
+function processTestnetPeerGeolocation(peerData, res) {
+  const { uniqueIPv4Addresses, uniqueIPv6Addresses } = peerData;
+
+  // Combine and geo-locate all IP addresses
+  const allIPs = [...uniqueIPv4Addresses, ...uniqueIPv6Addresses];
+  const geoData = allIPs.map((ip) => {
+    const geoInfo = geoip.lookup(ip);
+    return {
+      ip,
+      country: geoInfo?.country || 'Unknown',
+      city: geoInfo?.city || 'Unknown',
+      lat: geoInfo?.ll?.[0] || 0,
+      lon: geoInfo?.ll?.[1] || 0
+    };
+  });
+
+  console.log(`Testnet: Geo-located ${geoData.length} IP addresses`);
+
+  // Update testnet nodes (in memory, not database)
+  testnetUniqueNodes = geoData;
+
+  // Cache testnet peer data
+  peerCache.set('testnetPeerData', peerData, 600);    // 10 minutes
+  peerCache.set('testnetGeoNodes', testnetUniqueNodes, 600);
+  console.log('Testnet: Peer data cached for 10 minutes');
+
+  // Broadcast to testnet WebSocket clients
+  broadcastTestnetGeoData(testnetUniqueNodes);
+
+  // Send response
+  res.json(peerData);
+}
+
+/**
+ * Broadcast geo-located peer data to all testnet WebSocket clients
+ */
+function broadcastTestnetGeoData(geoNodes) {
+  const message = JSON.stringify({
+    type: 'geoData',
+    data: geoNodes
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting testnet geo data:', error);
+      }
+    }
+  });
+}
+
+/**
+ * Refresh testnet peer data from peers.dat
+ */
+async function refreshTestnetPeerData() {
+  const maxRetries = 3;
+  const retryDelay = 5000;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Testnet: Peer data fetch attempt ${attempt}/${maxRetries}`);
+
+      // Verify server is ready
+      const healthCheck = await axios.get(`http://localhost:${SERVER_CONFIG.port}/health`)
+        .catch(() => null);
+
+      if (!healthCheck) {
+        console.log(`Testnet: Server not ready, waiting ${retryDelay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        continue;
+      }
+
+      // Fetch testnet peer data from our own endpoint
+      const response = await axios.get(`http://localhost:${SERVER_CONFIG.port}/api/testnet/getpeers`);
+
+      if (response.data && (response.data.uniqueIPv4Addresses || response.data.uniqueIPv6Addresses)) {
+        const ipv4Count = response.data.uniqueIPv4Addresses?.length || 0;
+        const ipv6Count = response.data.uniqueIPv6Addresses?.length || 0;
+        console.log(`Testnet: Successfully fetched peer data: ${ipv4Count} IPv4 + ${ipv6Count} IPv6`);
+        return response.data;
+      } else {
+        throw new Error("Invalid testnet peer data response format");
+      }
+    } catch (error) {
+      console.log(`Testnet: Attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+
+      if (attempt === maxRetries) {
+        console.error('Testnet: Max retries reached for peer fetch');
+        if (peerCache.has('testnetPeerData')) {
+          console.log('Testnet: Using previously cached peer data as fallback');
+          return peerCache.get('testnetPeerData');
+        }
+        throw new Error('Failed to fetch testnet peer data after multiple attempts');
+      }
+
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  }
 }
 
 /**
@@ -3277,10 +3442,20 @@ async function startServer() {
     console.log('\nPhase 3: Loading peer network data...');
     try {
       await refreshPeerData();
-      console.log(`✓ Peer data loaded: ${uniqueNodes.length} nodes`);
+      console.log(`✓ Mainnet peer data loaded: ${uniqueNodes.length} nodes`);
     } catch (peerError) {
-      console.error('⚠ Error loading peer data:', peerError.message);
-      console.log('  Continuing without peer data - will retry in background');
+      console.error('⚠ Error loading mainnet peer data:', peerError.message);
+      console.log('  Continuing without mainnet peer data - will retry in background');
+    }
+
+    // Phase 3.5: Load testnet peer network data
+    console.log('\nPhase 3.5: Loading testnet peer network data...');
+    try {
+      await refreshTestnetPeerData();
+      console.log(`✓ Testnet peer data loaded: ${testnetUniqueNodes.length} nodes`);
+    } catch (peerError) {
+      console.error('⚠ Error loading testnet peer data:', peerError.message);
+      console.log('  Continuing without testnet peer data - will retry in background');
     }
 
     // Phase 4: Initialize ZeroMQ for real-time transaction monitoring
