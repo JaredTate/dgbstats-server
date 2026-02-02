@@ -38,14 +38,15 @@ The server acts as a middleware layer between the React frontend and a DigiByte 
 dgbstats-server/                   # Root directory
 │
 ├── Core Application
-│   ├── server.js                  # Main server (2554 lines)
+│   ├── server.js                  # Main server (2900+ lines)
 │   │   ├── HTTP/Express server (port 5001)
-│   │   ├── WebSocket server (port 5002)
+│   │   ├── WebSocket server mainnet (port 5002)
+│   │   ├── WebSocket server testnet (port 5003)
 │   │   ├── Cache management
 │   │   ├── Database operations
 │   │   └── ZeroMQ integration
 │   │
-│   ├── rpc.js                     # RPC interface (898 lines)
+│   ├── rpc.js                     # RPC interface (1000+ lines)
 │   │   ├── Express router (/api/*)
 │   │   ├── RPC request handling
 │   │   ├── Intelligent caching
@@ -63,14 +64,16 @@ dgbstats-server/                   # Root directory
 │
 ├── Utility Scripts
 │   ├── blocknotify.sh             # DigiByte node webhook script
-│   ├── parse_peers_dat.py         # Python peer parser
+│   ├── parse_peers_dat.py         # Python mainnet peer parser
+│   ├── parse_testnet_peers.py     # Python testnet peer parser
 │   └── check-transactions.js      # Debug utility
 │
 ├── Test Suite
 │   ├── tests/
 │   │   ├── unit/
 │   │   │   ├── rpc.test.js        # RPC unit tests
-│   │   │   └── server-core.test.js # Server logic tests
+│   │   │   ├── server-core.test.js # Server logic tests
+│   │   │   └── testnet.test.js    # Testnet-specific tests
 │   │   │
 │   │   ├── integration/
 │   │   │   ├── api.test.js        # REST API tests
@@ -142,7 +145,7 @@ dgbstats-server/                   # Root directory
 | `recentTransactions` | Server→Client | Confirmed transaction cache |
 | `transactionConfirmed` | Server→Client | Tx moved to block |
 | `mempool` | Server→Client | Mempool stats and transactions |
-| `initialData` | Server→Client | Blockchain info bundle |
+| `initialData` | Server→Client | Blockchain info bundle (includes deploymentInfo) |
 | `geoData` | Server→Client | Geographic peer locations |
 | `requestMempool` | Client→Server | Client requests mempool refresh |
 
@@ -211,16 +214,20 @@ All testnet endpoints mirror the mainnet API structure but are prefixed with `/a
 | `/api/testnet/gettxoutsetinfo` | Testnet UTXO set info |
 | `/api/testnet/getmempoolinfo` | Testnet mempool statistics |
 | `/api/testnet/getrawmempool` | Testnet full mempool transactions |
-| `/api/testnet/getpeerinfo` | Testnet connected peers |
+| `/api/testnet/getpeerinfo` | Testnet connected peers with geolocation |
+| `/api/testnet/getpeers` | Testnet peer discovery (testnet13/peers.dat) |
+| `/api/testnet/blocknotify` | Testnet block notification webhook (POST) |
 
 ### Testnet WebSocket
 
 The testnet WebSocket server runs on port 5003 and supports the same message types as mainnet:
 
-- `recentBlocks` - Initial testnet blocks on connect
+- `recentBlocks` - Initial testnet blocks on connect (240 blocks)
+- `recentTransactions` - Confirmed transaction cache
 - `newBlock` - Real-time testnet block notification
-- `initialData` - Testnet blockchain info bundle
+- `initialData` - Testnet blockchain info bundle (includes deploymentInfo)
 - `mempool` - Testnet mempool stats and transactions
+- `geoData` - Testnet peer geolocation data (from testnet13/peers.dat)
 
 ## Data Flow Architecture
 
@@ -681,11 +688,18 @@ DGB_RPC_USER=user DGB_RPC_PASSWORD=pass node server.js
 
 ### Key Statistics
 - **Core Files**: 3 (server.js, rpc.js, config.js)
-- **API Endpoints**: 15 REST endpoints
+- **API Endpoints**: 28 REST endpoints (16 mainnet, 12 testnet)
+- **WebSocket Servers**: 2 (mainnet port 5002, testnet port 5003)
 - **WebSocket Message Types**: 8 server-to-client, 1 client-to-server
 - **Database Tables**: 3 (nodes, visits, unique_ips)
-- **Test Files**: 10+ (unit, integration, legacy)
+- **Test Files**: 7 (3 unit, 4 integration)
+- **Test Cases**: 296+ with 95%+ coverage
 - **Dependencies**: 13 production packages
+
+### Network Support
+- **Mainnet**: Full support with RPC (port 14044), WebSocket (port 5002)
+- **Testnet**: Full support with RPC (port 14022), WebSocket (port 5003)
+- **Peer Discovery**: Separate peers.dat parsing for each network
 
 ### Performance Characteristics
 - Max concurrent RPC requests: 4
@@ -695,6 +709,7 @@ DGB_RPC_USER=user DGB_RPC_PASSWORD=pass node server.js
 - Confirmed transactions cached: 10
 - WebSocket ping interval: 30 seconds
 - Cache persistence interval: 60 seconds
+- Peer data refresh: 10 minutes
 
 ### Reliability Features
 - Stale cache fallback on RPC errors
@@ -702,9 +717,10 @@ DGB_RPC_USER=user DGB_RPC_PASSWORD=pass node server.js
 - Per-client WebSocket error isolation
 - ZeroMQ fallback to polling
 - Automatic cache recovery on restart
+- Testnet isolation from mainnet data
 
 ---
 
-*Architecture Document v1.0*
+*Architecture Document v1.1*
 *Last Updated: 2026-02-02*
 *DigiByte Stats Server - Real-Time Blockchain Data Provider*
