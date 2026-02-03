@@ -38,7 +38,7 @@ The server acts as a middleware layer between the React frontend and a DigiByte 
 dgbstats-server/                   # Root directory
 │
 ├── Core Application
-│   ├── server.js                  # Main server (2900+ lines)
+│   ├── server.js                  # Main server (3,579 lines)
 │   │   ├── HTTP/Express server (port 5001)
 │   │   ├── WebSocket server mainnet (port 5002)
 │   │   ├── WebSocket server testnet (port 5003)
@@ -46,11 +46,12 @@ dgbstats-server/                   # Root directory
 │   │   ├── Database operations
 │   │   └── ZeroMQ integration
 │   │
-│   ├── rpc.js                     # RPC interface (1000+ lines)
+│   ├── rpc.js                     # RPC interface (1,249 lines)
 │   │   ├── Express router (/api/*)
 │   │   ├── RPC request handling
 │   │   ├── Intelligent caching
-│   │   └── Rate limiting
+│   │   ├── Rate limiting
+│   │   └── DigiDollar/Oracle endpoints (testnet)
 │   │
 │   └── config.js                  # Environment configuration
 │       └── Development/production paths
@@ -147,6 +148,9 @@ dgbstats-server/                   # Root directory
 | `mempool` | Server→Client | Mempool stats and transactions |
 | `initialData` | Server→Client | Blockchain info bundle (includes deploymentInfo) |
 | `geoData` | Server→Client | Geographic peer locations |
+| `newTransaction` | Server→Client | New mempool transaction notification |
+| `removedTransaction` | Server→Client | Transaction removed from mempool |
+| `confirmedTransactions` | Server→Client | Bulk confirmations via ZeroMQ |
 | `requestMempool` | Client→Server | Client requests mempool refresh |
 
 ## API Endpoints
@@ -217,6 +221,17 @@ All testnet endpoints mirror the mainnet API structure but are prefixed with `/a
 | `/api/testnet/getpeerinfo` | Testnet connected peers with geolocation |
 | `/api/testnet/getpeers` | Testnet peer discovery (testnet13/peers.dat) |
 | `/api/testnet/blocknotify` | Testnet block notification webhook (POST) |
+
+### DigiDollar/Oracle Endpoints (Testnet Only)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/api/testnet/getdigidollarstats` | DigiDollar system statistics |
+| `/api/testnet/getoracleprice` | Current oracle price data |
+| `/api/testnet/getoracles` | Network-wide oracle information |
+| `/api/testnet/getalloracleprices` | Per-oracle price breakdown |
+| `/api/testnet/listoracle` | Local oracle status |
+| `/api/testnet/getprotectionstatus` | DigiDollar protection system status |
 
 ### Testnet WebSocket
 
@@ -687,13 +702,13 @@ DGB_RPC_USER=user DGB_RPC_PASSWORD=pass node server.js
 ## Architecture Summary
 
 ### Key Statistics
-- **Core Files**: 3 (server.js, rpc.js, config.js)
-- **API Endpoints**: 28 REST endpoints (16 mainnet, 12 testnet)
+- **Core Files**: 3 (server.js ~3,579 lines, rpc.js ~1,249 lines, config.js)
+- **API Endpoints**: 34 REST endpoints (16 mainnet, 12 testnet, 6 DigiDollar/Oracle)
 - **WebSocket Servers**: 2 (mainnet port 5002, testnet port 5003)
-- **WebSocket Message Types**: 8 server-to-client, 1 client-to-server
+- **WebSocket Message Types**: 10 server-to-client, 1 client-to-server
 - **Database Tables**: 3 (nodes, visits, unique_ips)
 - **Test Files**: 7 (3 unit, 4 integration)
-- **Test Cases**: 296+ with 95%+ coverage
+- **Test Cases**: 147 active tests with 95%+ coverage
 - **Dependencies**: 13 production packages
 
 ### Network Support

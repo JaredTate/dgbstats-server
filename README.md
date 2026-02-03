@@ -173,6 +173,14 @@ pm2 startup
 ### Testnet Endpoints (`/api/testnet/*`)
 All mainnet endpoints are mirrored with `/api/testnet/` prefix.
 
+### DigiDollar/Oracle Endpoints (Testnet Only)
+- `/api/testnet/getdigidollarstats` - DigiDollar system statistics
+- `/api/testnet/getoracleprice` - Current oracle price data
+- `/api/testnet/getoracles` - Network-wide oracle information
+- `/api/testnet/getalloracleprices` - Per-oracle price breakdown
+- `/api/testnet/listoracle` - Local oracle status
+- `/api/testnet/getprotectionstatus` - Protection system status
+
 ## Testing
 
 ```bash

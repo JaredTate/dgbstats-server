@@ -13,7 +13,7 @@ This project follows a **tests-first approach** where:
 
 ### Testing Statistics
 
-- **296+ Test Cases** across unit, integration, and e2e tests
+- **147 Active Test Cases** across unit and integration tests
 - **95%+ Code Coverage** on all critical paths
 - **Sub-60 second** full test suite execution
 - **Zero flaky tests** - all tests are deterministic and reliable
@@ -54,23 +54,22 @@ Our architecture is designed around testability:
 ```
 Test Layer          |  Application Layer        |  Purpose
 ===================|=========================|====================
-Unit Tests (89)    |  rpc.js functions        |  Test pure functions
-Unit Tests (80)    |  server.js core logic    |  Test business logic  
-Integration (127)  |  API + WebSocket + DB     |  Test interactions
-E2E Tests (20)     |  Complete workflows      |  Test user scenarios
+Unit Tests (71)    |  rpc.js, server.js       |  Test pure functions
+Integration (76)   |  API + WebSocket + DB     |  Test interactions
 ```
 
 ### Test Categories
 
-#### 1. **Unit Tests** (`tests/unit/`)
-- **rpc.test.js** (45 tests) - RPC functionality, caching, rate limiting
-- **server-core.test.js** (44 tests) - Core server functions, data processing
+#### 1. **Unit Tests** (`tests/unit/`) - 71 tests
+- **rpc.test.js** (22 tests) - RPC functionality, caching, rate limiting
+- **server-core.test.js** (17 tests) - Core server functions, data processing
+- **testnet.test.js** (32 tests) - Testnet-specific RPC operations
 
-#### 2. **Integration Tests** (`tests/integration/`)
-- **api.test.js** (31 tests) - HTTP API endpoints
-- **websocket.test.js** (34 tests) - Real-time WebSocket communication
-- **database.test.js** (42 tests) - SQLite operations and data persistence
-- **end-to-end.test.js** (20 tests) - Complete application workflows
+#### 2. **Integration Tests** (`tests/integration/`) - 76 tests
+- **api.test.js** (40 tests) - HTTP API endpoints
+- **websocket.test.js** (18 tests) - Real-time WebSocket communication
+- **database.test.js** (7 tests) - SQLite operations and data persistence
+- **end-to-end.test.js** (11 tests) - Complete application workflows
 
 ## Running Tests
 
@@ -154,15 +153,32 @@ All endpoints are **thoroughly tested** with both success and failure scenarios:
 - `POST /api/refreshcache` - ✅ **Cache management tested**
 - `POST /api/refresh-peers` - ✅ **Peer data refresh tested**
 
+### DigiDollar/Oracle Endpoints (Testnet Only)
+- `GET /api/testnet/getdigidollarstats` - ✅ **DigiDollar system statistics**
+- `GET /api/testnet/getoracleprice` - ✅ **Current oracle price data**
+- `GET /api/testnet/getoracles` - ✅ **Network-wide oracle information**
+- `GET /api/testnet/getalloracleprices` - ✅ **Per-oracle price breakdown**
+- `GET /api/testnet/listoracle` - ✅ **Local oracle status**
+- `GET /api/testnet/getprotectionstatus` - ✅ **Protection system status**
+
 ## WebSocket Events (Fully Tested)
 
-Real-time functionality with **34 comprehensive tests**:
+Real-time functionality with **18 comprehensive tests**:
 
-### Client-bound Events
+### Client-bound Events (10 message types)
 - `recentBlocks` - ✅ **Initial data delivery tested**
-- `initialData` - ✅ **Blockchain statistics package tested**  
+- `recentTransactions` - ✅ **Confirmed transactions tested**
+- `mempool` - ✅ **Mempool stats and transactions tested**
+- `initialData` - ✅ **Blockchain statistics package tested**
 - `geoData` - ✅ **Geo-located peer data tested**
-- `newBlock` - ✅ **Real-time notifications tested**
+- `newBlock` - ✅ **Real-time block notifications tested**
+- `newTransaction` - ✅ **Real-time mempool tx notifications**
+- `removedTransaction` - ✅ **Transaction removal notifications**
+- `transactionConfirmed` - ✅ **Confirmation notifications tested**
+- `confirmedTransactions` - ✅ **Bulk confirmation via ZeroMQ**
+
+### Client-to-Server Events (1 message type)
+- `requestMempool` - ✅ **On-demand mempool refresh**
 
 ### Connection Management
 - ✅ **Connection lifecycle tested** (connect, ping/pong, disconnect)
