@@ -223,6 +223,18 @@ let testnetMempoolCache = {
  */
 const testnetMempoolTransactionHistory = new Map();
 
+/**
+ * In-memory cache for testnet oracle data (pushed via WebSocket)
+ * Combined data from getoracleprice + getalloracleprices + getoracles
+ */
+let testnetOracleCache = null;
+
+/**
+ * In-memory cache for testnet DigiDollar stats data (pushed via WebSocket)
+ * Combined data from getdigidollarstats + getoracleprice
+ */
+let testnetDDStatsCache = null;
+
 // ============================================================================
 // DATABASE SETUP
 // ============================================================================
@@ -392,6 +404,24 @@ wssTestnet.on('connection', (ws) => {
     ws.send(JSON.stringify({
       type: 'geoData',
       data: testnetUniqueNodes
+    }));
+  }
+
+  // Send cached oracle data immediately
+  if (testnetOracleCache) {
+    console.log('Sending cached oracle data to new testnet client');
+    ws.send(JSON.stringify({
+      type: 'oracleData',
+      data: testnetOracleCache
+    }));
+  }
+
+  // Send cached DD stats data immediately
+  if (testnetDDStatsCache) {
+    console.log('Sending cached DD stats data to new testnet client');
+    ws.send(JSON.stringify({
+      type: 'ddStatsData',
+      data: testnetDDStatsCache
     }));
   }
 
@@ -1408,6 +1438,121 @@ function broadcastTestnetNewBlock(newBlock) {
   });
 
   console.log(`Testnet: New block ${newBlock.height} broadcast to ${wssTestnet.clients.size} clients`);
+}
+
+// ============================================================================
+// TESTNET ORACLE & DIGIDOLLAR DATA BROADCASTING
+// ============================================================================
+
+/**
+ * Fetch oracle data from testnet RPC and update cache
+ * Calls getoracleprice, getalloracleprices, and getoracles in parallel
+ */
+async function fetchTestnetOracleData() {
+  try {
+    const [price, allPrices, oracles] = await Promise.all([
+      sendTestnetRpcRequest('getoracleprice', [], true),
+      sendTestnetRpcRequest('getalloracleprices', [], true),
+      sendTestnetRpcRequest('getoracles', [], true)
+    ]);
+
+    if (price && allPrices) {
+      testnetOracleCache = {
+        price: price,
+        allPrices: allPrices,
+        oracles: oracles || []
+      };
+      return testnetOracleCache;
+    }
+  } catch (error) {
+    console.error('Error fetching testnet oracle data:', error.message);
+  }
+  return null;
+}
+
+/**
+ * Fetch DigiDollar stats from testnet RPC and update cache
+ * Calls getdigidollarstats and getoracleprice in parallel
+ */
+async function fetchTestnetDDStatsData() {
+  try {
+    const [stats, oraclePrice] = await Promise.all([
+      sendTestnetRpcRequest('getdigidollarstats', [], true),
+      sendTestnetRpcRequest('getoracleprice', [], true)
+    ]);
+
+    if (stats) {
+      testnetDDStatsCache = {
+        stats: stats,
+        oraclePrice: oraclePrice || {}
+      };
+      return testnetDDStatsCache;
+    }
+  } catch (error) {
+    console.error('Error fetching testnet DD stats data:', error.message);
+  }
+  return null;
+}
+
+/**
+ * Broadcast oracle data to all connected testnet WebSocket clients
+ */
+function broadcastTestnetOracleData() {
+  if (!testnetOracleCache) return;
+
+  const message = JSON.stringify({
+    type: 'oracleData',
+    data: testnetOracleCache
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting oracle data to testnet client:', error);
+      }
+    }
+  });
+}
+
+/**
+ * Broadcast DD stats data to all connected testnet WebSocket clients
+ */
+function broadcastTestnetDDStats() {
+  if (!testnetDDStatsCache) return;
+
+  const message = JSON.stringify({
+    type: 'ddStatsData',
+    data: testnetDDStatsCache
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting DD stats to testnet client:', error);
+      }
+    }
+  });
+}
+
+/**
+ * Fetch and broadcast oracle + DD stats data to all testnet clients
+ * Called on a 15-second interval
+ */
+async function refreshAndBroadcastOracleData() {
+  try {
+    await Promise.all([
+      fetchTestnetOracleData(),
+      fetchTestnetDDStatsData()
+    ]);
+    broadcastTestnetOracleData();
+    broadcastTestnetDDStats();
+  } catch (error) {
+    console.error('Error in oracle/DD stats refresh cycle:', error.message);
+  }
 }
 
 /**
@@ -3535,6 +3680,16 @@ async function startServer() {
         console.error('Mempool monitoring error:', err));
     }, 10000);
     */
+
+    // Oracle and DD stats data updates (every 15 seconds)
+    setInterval(() => {
+      refreshAndBroadcastOracleData().catch(err =>
+        console.error('Scheduled oracle/DD stats refresh failed:', err));
+    }, 15000);
+
+    // Initial oracle/DD stats fetch at startup
+    refreshAndBroadcastOracleData().catch(err =>
+      console.error('Initial oracle/DD stats fetch failed:', err));
 
     console.log('✓ Periodic maintenance scheduled');
 
