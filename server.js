@@ -1954,8 +1954,8 @@ async function refreshTestnetPeerData() {
         continue;
       }
 
-      // Fetch testnet peer data from our own endpoint
-      const response = await axios.get(`http://localhost:${SERVER_CONFIG.port}/api/testnet/getpeers`);
+      // Fetch testnet peer data from our own endpoint (60s timeout to prevent blocking startup)
+      const response = await axios.get(`http://localhost:${SERVER_CONFIG.port}/api/testnet/getpeers`, { timeout: 60000 });
 
       if (response.data && (response.data.uniqueIPv4Addresses || response.data.uniqueIPv6Addresses)) {
         const ipv4Count = response.data.uniqueIPv4Addresses?.length || 0;
@@ -3209,8 +3209,8 @@ async function refreshPeerData() {
         continue;
       }
 
-      // Fetch peer data from our own endpoint
-      const response = await axios.get(`http://localhost:${SERVER_CONFIG.port}/api/getpeers`);
+      // Fetch peer data from our own endpoint (60s timeout to prevent blocking startup)
+      const response = await axios.get(`http://localhost:${SERVER_CONFIG.port}/api/getpeers`, { timeout: 60000 });
       
       if (response.data && (response.data.uniqueIPv4Addresses || response.data.uniqueIPv6Addresses)) {
         const ipv4Count = response.data.uniqueIPv4Addresses?.length || 0;
@@ -3585,6 +3585,16 @@ async function startServer() {
       updateTestnetMempoolCache().then(() => console.log('✓ Testnet mempool cache loaded'))
     ]);
 
+    // Phase 2.7: Start oracle/DD stats refresh (independent of peer data)
+    console.log('\nPhase 2.7: Starting oracle and DigiDollar stats...');
+    setInterval(() => {
+      refreshAndBroadcastOracleData().catch(err =>
+        console.error('Scheduled oracle/DD stats refresh failed:', err));
+    }, 15000);
+    refreshAndBroadcastOracleData().catch(err =>
+      console.error('Initial oracle/DD stats fetch failed:', err));
+    console.log('✓ Oracle/DD stats interval started (every 15s)');
+
     // Phase 3: Load peer network data
     console.log('\nPhase 3: Loading peer network data...');
     try {
@@ -3682,16 +3692,6 @@ async function startServer() {
         console.error('Mempool monitoring error:', err));
     }, 10000);
     */
-
-    // Oracle and DD stats data updates (every 15 seconds)
-    setInterval(() => {
-      refreshAndBroadcastOracleData().catch(err =>
-        console.error('Scheduled oracle/DD stats refresh failed:', err));
-    }, 15000);
-
-    // Initial oracle/DD stats fetch at startup
-    refreshAndBroadcastOracleData().catch(err =>
-      console.error('Initial oracle/DD stats fetch failed:', err));
 
     console.log('✓ Periodic maintenance scheduled');
 
