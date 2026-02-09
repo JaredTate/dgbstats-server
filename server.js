@@ -1462,6 +1462,7 @@ async function fetchTestnetOracleData() {
         allPrices: allPrices,
         oracles: oracles || []
       };
+      console.log(`Testnet oracle data cached: price=$${price.price_usd}, ${(oracles || []).length} oracles`);
       return testnetOracleCache;
     }
   } catch (error) {
@@ -1486,6 +1487,7 @@ async function fetchTestnetDDStatsData() {
         stats: stats,
         oraclePrice: oraclePrice || {}
       };
+      console.log(`Testnet DD stats cached: health=${stats.health_percentage}%, supply=${stats.total_dd_supply}`);
       return testnetDDStatsCache;
     }
   } catch (error) {
