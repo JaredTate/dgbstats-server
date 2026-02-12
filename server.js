@@ -235,6 +235,12 @@ let testnetOracleCache = null;
  */
 let testnetDDStatsCache = null;
 
+/**
+ * In-memory cache for testnet DigiDollar deployment info (pushed via WebSocket)
+ * Data from getdigidollardeploymentinfo
+ */
+let testnetDeploymentCache = null;
+
 // ============================================================================
 // DATABASE SETUP
 // ============================================================================
@@ -422,6 +428,15 @@ wssTestnet.on('connection', (ws) => {
     ws.send(JSON.stringify({
       type: 'ddStatsData',
       data: testnetDDStatsCache
+    }));
+  }
+
+  // Send cached DD deployment data immediately
+  if (testnetDeploymentCache) {
+    console.log('Sending cached DD deployment data to new testnet client');
+    ws.send(JSON.stringify({
+      type: 'ddDeploymentData',
+      data: testnetDeploymentCache
     }));
   }
 
@@ -1497,6 +1512,25 @@ async function fetchTestnetDDStatsData() {
 }
 
 /**
+ * Fetch DigiDollar deployment info from testnet RPC and update cache
+ * Calls getdigidollardeploymentinfo
+ */
+async function fetchTestnetDeploymentData() {
+  try {
+    const deploymentInfo = await sendTestnetRpcRequest('getdigidollardeploymentinfo', [], true);
+
+    if (deploymentInfo) {
+      testnetDeploymentCache = deploymentInfo;
+      console.log(`Testnet DD deployment data cached: status=${deploymentInfo.status || 'unknown'}`);
+      return testnetDeploymentCache;
+    }
+  } catch (error) {
+    console.warn('Warning fetching testnet DD deployment data:', error.message);
+  }
+  return null;
+}
+
+/**
  * Broadcast oracle data to all connected testnet WebSocket clients
  */
 function broadcastTestnetOracleData() {
@@ -1541,6 +1575,28 @@ function broadcastTestnetDDStats() {
 }
 
 /**
+ * Broadcast DD deployment data to all connected testnet WebSocket clients
+ */
+function broadcastTestnetDeploymentData() {
+  if (!testnetDeploymentCache) return;
+
+  const message = JSON.stringify({
+    type: 'ddDeploymentData',
+    data: testnetDeploymentCache
+  });
+
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting DD deployment data to testnet client:', error);
+      }
+    }
+  });
+}
+
+/**
  * Fetch and broadcast oracle + DD stats data to all testnet clients
  * Called on a 15-second interval
  */
@@ -1548,10 +1604,12 @@ async function refreshAndBroadcastOracleData() {
   try {
     await Promise.all([
       fetchTestnetOracleData(),
-      fetchTestnetDDStatsData()
+      fetchTestnetDDStatsData(),
+      fetchTestnetDeploymentData()
     ]);
     broadcastTestnetOracleData();
     broadcastTestnetDDStats();
+    broadcastTestnetDeploymentData();
   } catch (error) {
     console.error('Error in oracle/DD stats refresh cycle:', error.message);
   }
