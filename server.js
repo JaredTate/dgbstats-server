@@ -80,7 +80,7 @@ const ZMQ_CONFIG = {
 const TESTNET_RPC_CONFIG = {
   user: process.env.DGB_TESTNET_RPC_USER || 'user',
   password: process.env.DGB_TESTNET_RPC_PASSWORD || 'password',
-  url: process.env.DGB_TESTNET_RPC_URL || 'http://127.0.0.1:14022',
+  url: process.env.DGB_TESTNET_RPC_URL || 'http://127.0.0.1:14026',
   timeout: 30000
 };
 
