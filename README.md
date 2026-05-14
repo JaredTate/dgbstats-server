@@ -102,7 +102,7 @@ txindex=1
 rpcuser=your_rpc_username
 rpcpassword=your_secure_password
 rpcallowip=127.0.0.1
-rpcport=14022
+rpcport=14026
 
 # Performance Settings
 rpcworkqueue=64
@@ -126,7 +126,7 @@ export DGB_RPC_URL=http://127.0.0.1:14044
 # Testnet RPC
 export DGB_TESTNET_RPC_USER=your_username
 export DGB_TESTNET_RPC_PASSWORD=your_password
-export DGB_TESTNET_RPC_URL=http://127.0.0.1:14022
+export DGB_TESTNET_RPC_URL=http://127.0.0.1:14026
 
 # Server Ports (optional - defaults shown)
 export PORT=5001

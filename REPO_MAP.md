@@ -21,11 +21,11 @@
 ### config.js
 - Runtime configuration module exported via `module.exports`.
 - Defines active environment (`development`/`production`) and filesystem paths.
-- Primary configured path: `peersDataPath` for DigiByte `peers.dat` location.
+- Primary configured paths: `peersDataPath` for mainnet and `testnetPeersDataPath` for testnet24 peer discovery.
 
 ### config.template.js
 - Template config intended to be copied to `config.js`.
-- Same structure as `config.js` with example dev/prod `peersDataPath` values.
+- Same structure as `config.js` with example dev/prod `peersDataPath` and `testnetPeersDataPath` values.
 - Serves as environment bootstrap/reference file.
 
 ### package.json

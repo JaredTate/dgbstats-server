@@ -8,7 +8,9 @@ import subprocess
 def parse_peers_dat(filepath):
     with open(filepath, 'rb') as file:
         data = file.read()
-        # print("File read successfully. Data length:", len(data))
+
+        if len(data) < 82:
+            return [], []
 
         # Parse header
         message_bytes = data[:4]
@@ -17,6 +19,11 @@ def parse_peers_dat(filepath):
         new_address_count = struct.unpack("<I", data[38:42])[0]
         tried_address_count = struct.unpack("<I", data[42:46])[0]
         new_bucket_count = struct.unpack("<I", data[46:50])[0] ^ (1 << 30)
+        total_address_count = new_address_count + tried_address_count
+
+        expected_min_length = 50 + (total_address_count * 62) + 32
+        if len(data) < expected_min_length:
+            return [], []
 
         # Parse peer entries
         offset = 50
@@ -24,7 +31,7 @@ def parse_peers_dat(filepath):
         ipv4_addresses = set()
         ipv6_addresses = set()
 
-        for _ in range(new_address_count + tried_address_count):
+        for _ in range(total_address_count):
             peer_data = data[offset:offset+62]
             ip = parse_ip_address(peer_data[16:32])
             if ip is not None:
@@ -37,12 +44,14 @@ def parse_peers_dat(filepath):
             offset += 62
 
         # Verify data integrity
-        assert len(ipv4_addresses) + len(ipv6_addresses) <= new_address_count + tried_address_count
+        if len(ipv4_addresses) + len(ipv6_addresses) > total_address_count:
+            return [], []
 
         # Verify checksum
         checksum = data[-32:]
         calculated_checksum = hashlib.sha256(hashlib.sha256(data[:-32]).digest()).digest()
-        assert checksum == calculated_checksum
+        if checksum != calculated_checksum:
+            return [], []
 
         return list(ipv4_addresses), list(ipv6_addresses)
 
@@ -75,21 +84,20 @@ def get_config():
         capture_output=True, text=True)
     return json.loads(result.stdout)
 
-# Get peers.dat path from config
-config = get_config()
-peers_dat_path = config['peersDataPath']
+def build_output(unique_ipv4_addresses, unique_ipv6_addresses):
+    return {
+        'uniqueIPv4Addresses': unique_ipv4_addresses,
+        'uniqueIPv6Addresses': unique_ipv6_addresses,
+        'totalUniquePeers': len(unique_ipv4_addresses) + len(unique_ipv6_addresses),
+        'totalUniqueIPv4Peers': len(unique_ipv4_addresses),
+        'totalUniqueIPv6Peers': len(unique_ipv6_addresses)
+    }
 
-# Parse the peers.dat file
-unique_ipv4_addresses, unique_ipv6_addresses = parse_peers_dat(peers_dat_path)
+def main():
+    config = get_config()
+    peers_dat_path = os.environ.get('PEERS_DAT_PATH') or config['peersDataPath']
+    unique_ipv4_addresses, unique_ipv6_addresses = parse_peers_dat(peers_dat_path)
+    print(json.dumps(build_output(unique_ipv4_addresses, unique_ipv6_addresses)))
 
-# Prepare the output data
-output = {
-    'uniqueIPv4Addresses': unique_ipv4_addresses,
-    'uniqueIPv6Addresses': unique_ipv6_addresses,
-    'totalUniquePeers': len(unique_ipv4_addresses) + len(unique_ipv6_addresses),
-    'totalUniqueIPv4Peers': len(unique_ipv4_addresses),
-    'totalUniqueIPv6Peers': len(unique_ipv6_addresses)
-}
-
-# Output the data as JSON
-print(json.dumps(output))
+if __name__ == '__main__':
+    main()

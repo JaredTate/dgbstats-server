@@ -199,7 +199,7 @@ The server provides full testnet support with dedicated RPC connections, WebSock
 
 | Component | Configuration |
 |-----------|---------------|
-| Testnet RPC Port | 14022 |
+| Testnet RPC Port | 14026 |
 | Testnet WebSocket Server | Port 5003 |
 | Testnet API Base Path | `/api/testnet/*` |
 
@@ -219,7 +219,7 @@ All testnet endpoints mirror the mainnet API structure but are prefixed with `/a
 | `/api/testnet/getmempoolinfo` | Testnet mempool statistics |
 | `/api/testnet/getrawmempool` | Testnet full mempool transactions |
 | `/api/testnet/getpeerinfo` | Testnet connected peers with geolocation |
-| `/api/testnet/getpeers` | Testnet peer discovery (testnet13/peers.dat) |
+| `/api/testnet/getpeers` | Testnet peer discovery (testnet24/peers.dat) |
 | `/api/testnet/blocknotify` | Testnet block notification webhook (POST) |
 
 ### DigiDollar/Oracle Endpoints (Testnet Only)
@@ -242,7 +242,7 @@ The testnet WebSocket server runs on port 5003 and supports the same message typ
 - `newBlock` - Real-time testnet block notification
 - `initialData` - Testnet blockchain info bundle (includes deploymentInfo)
 - `mempool` - Testnet mempool stats and transactions
-- `geoData` - Testnet peer geolocation data (from testnet13/peers.dat)
+- `geoData` - Testnet peer geolocation data (from testnet24/peers.dat)
 
 ## Data Flow Architecture
 
@@ -394,7 +394,7 @@ DGB_RPC_PASSWORD=password   # RPC authentication password
 DGB_RPC_URL=http://127.0.0.1:14044  # RPC endpoint
 
 # Testnet RPC Configuration
-DGB_TESTNET_RPC_URL=http://127.0.0.1:14022  # Testnet RPC endpoint
+DGB_TESTNET_RPC_URL=http://127.0.0.1:14026  # Testnet RPC endpoint
 DGB_TESTNET_RPC_USER=user                    # Testnet RPC username
 DGB_TESTNET_RPC_PASSWORD=password            # Testnet RPC password
 DGB_TESTNET_WS_PORT=5003                     # Testnet WebSocket port
@@ -713,7 +713,7 @@ DGB_RPC_USER=user DGB_RPC_PASSWORD=pass node server.js
 
 ### Network Support
 - **Mainnet**: Full support with RPC (port 14044), WebSocket (port 5002)
-- **Testnet**: Full support with RPC (port 14022), WebSocket (port 5003)
+- **Testnet**: Full support with RPC (port 14026), WebSocket (port 5003)
 - **Peer Discovery**: Separate peers.dat parsing for each network
 
 ### Performance Characteristics
