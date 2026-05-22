@@ -58,7 +58,7 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     expect(rpcContents).toContain("sendTestnetRpcRequest('getprotectionstatus'");
   });
 
-  test('testnet defaults match current testnet24 ports and peer path', () => {
+  test('testnet defaults match current testnet25 ports and peer path', () => {
     const serverContents = readProjectFile('server.js');
     const rpcContents = readProjectFile('rpc.js');
     const templateContents = readProjectFile('config.template.js');
@@ -70,9 +70,9 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
 
     expect(serverContents).toContain("http://127.0.0.1:14026");
     expect(rpcContents).toContain("http://127.0.0.1:14026");
-    expect(templateContents).toContain("testnet24/peers.dat");
+    expect(templateContents).toContain("testnet25/peers.dat");
     expect(testnetPeerParserContents).toContain("testnetPeersDataPath");
-    expect(testnetPeerParserContents).toContain("'testnet24', 'peers.dat'");
+    expect(testnetPeerParserContents).toContain("'testnet25', 'peers.dat'");
     expect(docsContents).toContain("14026");
     expect(docsContents).not.toContain("14022");
   });
