@@ -230,6 +230,7 @@ All testnet endpoints mirror the mainnet API structure but are prefixed with `/a
 | `/api/testnet/getoracleprice` | Current oracle price data |
 | `/api/testnet/getoracles` | Network-wide oracle information |
 | `/api/testnet/getalloracleprices` | Per-oracle price breakdown |
+| `/api/testnet/getoraclesigners` | Recent bundle signer IDs |
 | `/api/testnet/listoracle` | Local oracle status |
 | `/api/testnet/getprotectionstatus` | DigiDollar protection system status |
 

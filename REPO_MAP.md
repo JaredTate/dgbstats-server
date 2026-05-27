@@ -56,7 +56,7 @@
   - `POST /refreshcache`
 - Testnet API routes (router):
   - `GET /testnet/getblockchaininfo`, `/testnet/getblockhash/:height`, `/testnet/getblock/:hash`, `/testnet/getchaintxstats`, `/testnet/gettxoutsetinfo`, `/testnet/getpeerinfo`, `/testnet/getblockreward`, `/testnet/getmempoolinfo`, `/testnet/getrawmempool`, `/testnet/getlatestblock`
-  - DigiDollar/oracle routes: `/testnet/getdigidollarstats`, `/testnet/getoracleprice`, `/testnet/getoracles`, `/testnet/getalloracleprices`, `/testnet/listoracle`, `/testnet/getprotectionstatus`
+  - DigiDollar/oracle routes: `/testnet/getdigidollarstats`, `/testnet/getoracleprice`, `/testnet/getoracles`, `/testnet/getalloracleprices`, `/testnet/getoraclesigners`, `/testnet/listoracle`, `/testnet/getprotectionstatus`
 - Exports:
   - `router`, `sendRpcRequest`, `sendTestnetRpcRequest`, `getTransactionData`, `getAlgoName`, `getBlocksByTimeRange`, `preloadEssentialData`, `getCacheStats`, `resetCacheStats`, `rpcCache`, `fetchBlocksInBatch`.
 

@@ -1203,6 +1203,24 @@ router.get('/testnet/getalloracleprices', async (req, res) => {
 });
 
 /**
+ * Get recent MuSig2 oracle bundle signers
+ * Returns exact oracle IDs that signed each recent on-chain bundle
+ */
+router.get('/testnet/getoraclesigners', async (req, res) => {
+  try {
+    const requestedBlocks = Number.parseInt(req.query.blocks || '100', 10);
+    const blocks = Number.isFinite(requestedBlocks)
+      ? Math.max(1, Math.min(1000, requestedBlocks))
+      : 100;
+    const data = await sendTestnetRpcRequest('getoraclesigners', [blocks]);
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getoraclesigners:', error);
+    res.status(500).json({ error: 'Error fetching oracle bundle signers', details: error.message });
+  }
+});
+
+/**
  * Get local oracle status (is your local oracle running?)
  * Returns status of oracle running on THIS node
  */

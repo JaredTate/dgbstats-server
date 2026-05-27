@@ -178,6 +178,7 @@ All mainnet endpoints are mirrored with `/api/testnet/` prefix.
 - `/api/testnet/getoracleprice` - Current oracle price data
 - `/api/testnet/getoracles` - Network-wide oracle information
 - `/api/testnet/getalloracleprices` - Per-oracle price breakdown
+- `/api/testnet/getoraclesigners` - Recent bundle signer IDs
 - `/api/testnet/listoracle` - Local oracle status
 - `/api/testnet/getprotectionstatus` - Protection system status
 

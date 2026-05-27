@@ -54,7 +54,9 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     expect(serverContents).toContain("sendTestnetRpcRequest('getoracleprice'");
     expect(serverContents).toContain("sendTestnetRpcRequest('getalloracleprices'");
     expect(serverContents).toContain("sendTestnetRpcRequest('getoracles'");
+    expect(serverContents).toContain("sendTestnetRpcRequest('getoraclesigners'");
     expect(serverContents).toContain("sendTestnetRpcRequest('getdigidollardeploymentinfo'");
+    expect(rpcContents).toContain("sendTestnetRpcRequest('getoraclesigners'");
     expect(rpcContents).toContain("sendTestnetRpcRequest('getprotectionstatus'");
   });
 

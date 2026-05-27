@@ -225,7 +225,7 @@ const testnetMempoolTransactionHistory = new Map();
 
 /**
  * In-memory cache for testnet oracle data (pushed via WebSocket)
- * Combined data from getoracleprice + getalloracleprices + getoracles
+ * Combined data from getoracleprice + getalloracleprices + getoracles + getoraclesigners
  */
 let testnetOracleCache = null;
 
@@ -1461,23 +1461,28 @@ function broadcastTestnetNewBlock(newBlock) {
 
 /**
  * Fetch oracle data from testnet RPC and update cache
- * Calls getoracleprice, getalloracleprices, and getoracles in parallel
+ * Calls getoracleprice, getalloracleprices, getoracles, and getoraclesigners in parallel
  */
 async function fetchTestnetOracleData() {
   try {
-    const [price, allPrices, oracles] = await Promise.all([
+    const [price, allPrices, oracles, oracleSigners] = await Promise.all([
       sendTestnetRpcRequest('getoracleprice', [], true),
       sendTestnetRpcRequest('getalloracleprices', [], true),
-      sendTestnetRpcRequest('getoracles', [], true)
+      sendTestnetRpcRequest('getoracles', [], true),
+      sendTestnetRpcRequest('getoraclesigners', [100], true).catch((error) => {
+        console.warn('Warning fetching testnet oracle bundle signers:', error.message);
+        return null;
+      })
     ]);
 
     if (price && allPrices) {
       testnetOracleCache = {
         price: price,
         allPrices: allPrices,
-        oracles: oracles || []
+        oracles: oracles || [],
+        oracleSigners: oracleSigners || { bundle_count: 0, bundles: [] }
       };
-      console.log(`Testnet oracle data cached: price=$${price.price_usd}, ${(oracles || []).length} oracles`);
+      console.log(`Testnet oracle data cached: price=$${price.price_usd}, ${(oracles || []).length} oracles, ${(oracleSigners && oracleSigners.bundle_count) || 0} signer bundles`);
       return testnetOracleCache;
     }
   } catch (error) {
