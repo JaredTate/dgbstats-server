@@ -28,15 +28,19 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     });
   });
 
-  test('does not contain deprecated testnet19/port 12033 references', () => {
+  test('does not contain deprecated testnet25/port 12032 references in active config/docs', () => {
     const filesToCheck = [
       'server.js',
       'rpc.js',
       'config.js',
-      'config.template.js'
+      'config.template.js',
+      'parse_testnet_peers.py',
+      'README.md',
+      'ARCHITECTURE.md',
+      'REPO_MAP.md'
     ];
 
-    const deprecatedMarkers = ['testnet19', '12033'];
+    const deprecatedMarkers = ['testnet25/peers.dat', '12032'];
 
     filesToCheck.forEach((file) => {
       const contents = readProjectFile(file);
@@ -60,7 +64,7 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     expect(rpcContents).toContain("sendTestnetRpcRequest('getprotectionstatus'");
   });
 
-  test('testnet defaults match current testnet25 ports and peer path', () => {
+  test('testnet defaults match current testnet26 ports and peer path', () => {
     const serverContents = readProjectFile('server.js');
     const rpcContents = readProjectFile('rpc.js');
     const templateContents = readProjectFile('config.template.js');
@@ -72,9 +76,9 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
 
     expect(serverContents).toContain("http://127.0.0.1:14026");
     expect(rpcContents).toContain("http://127.0.0.1:14026");
-    expect(templateContents).toContain("testnet25/peers.dat");
+    expect(templateContents).toContain("testnet26/peers.dat");
     expect(testnetPeerParserContents).toContain("testnetPeersDataPath");
-    expect(testnetPeerParserContents).toContain("'testnet25', 'peers.dat'");
+    expect(testnetPeerParserContents).toContain("'testnet26', 'peers.dat'");
     expect(docsContents).toContain("14026");
     expect(docsContents).not.toContain("14022");
   });

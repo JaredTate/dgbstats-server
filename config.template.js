@@ -7,11 +7,11 @@ module.exports = {
     paths: {
         development: {
             peersDataPath: "/Users/jt/Library/Application Support/DigiByte/peers.dat",
-            testnetPeersDataPath: "/Users/jt/Library/Application Support/DigiByte/testnet25/peers.dat"
+            testnetPeersDataPath: "/Users/jt/Library/Application Support/DigiByte/testnet26/peers.dat"
         },
         production: {
             peersDataPath: "/home/digihash/.digibyte-scrypt/peers.dat",
-            testnetPeersDataPath: "/home/digihash/.digibyte-scrypt/testnet25/peers.dat"
+            testnetPeersDataPath: "/home/digihash/.digibyte-scrypt/testnet26/peers.dat"
         }
     }
 };

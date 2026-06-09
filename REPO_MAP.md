@@ -21,7 +21,7 @@
 ### config.js
 - Runtime configuration module exported via `module.exports`.
 - Defines active environment (`development`/`production`) and filesystem paths.
-- Primary configured paths: `peersDataPath` for mainnet and `testnetPeersDataPath` for testnet25 peer discovery.
+- Primary configured paths: `peersDataPath` for mainnet and `testnetPeersDataPath` for testnet26 peer discovery.
 
 ### config.template.js
 - Template config intended to be copied to `config.js`.

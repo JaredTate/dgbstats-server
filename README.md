@@ -87,7 +87,7 @@ zmqpubhashblock=tcp://127.0.0.1:28334
 
 ### Testnet Configuration
 
-For testnet, add to `~/.digibyte/digibyte.conf` or create `~/.digibyte/testnet4/digibyte.conf`:
+For testnet, add to `~/.digibyte/digibyte.conf` or create `~/.digibyte/testnet26/digibyte.conf`:
 
 ```ini
 # Enable Testnet

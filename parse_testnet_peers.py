@@ -89,7 +89,7 @@ def get_testnet_peers_path(config):
 
     mainnet_path = config.get('peersDataPath')
     if mainnet_path:
-        return os.path.join(os.path.dirname(mainnet_path), 'testnet25', 'peers.dat')
+        return os.path.join(os.path.dirname(mainnet_path), 'testnet26', 'peers.dat')
 
     raise KeyError('testnetPeersDataPath')
 

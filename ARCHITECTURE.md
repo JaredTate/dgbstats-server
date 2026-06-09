@@ -219,7 +219,7 @@ All testnet endpoints mirror the mainnet API structure but are prefixed with `/a
 | `/api/testnet/getmempoolinfo` | Testnet mempool statistics |
 | `/api/testnet/getrawmempool` | Testnet full mempool transactions |
 | `/api/testnet/getpeerinfo` | Testnet connected peers with geolocation |
-| `/api/testnet/getpeers` | Testnet peer discovery (testnet25/peers.dat) |
+| `/api/testnet/getpeers` | Testnet peer discovery (testnet26/peers.dat) |
 | `/api/testnet/blocknotify` | Testnet block notification webhook (POST) |
 
 ### DigiDollar/Oracle Endpoints (Testnet Only)
@@ -243,7 +243,7 @@ The testnet WebSocket server runs on port 5003 and supports the same message typ
 - `newBlock` - Real-time testnet block notification
 - `initialData` - Testnet blockchain info bundle (includes deploymentInfo)
 - `mempool` - Testnet mempool stats and transactions
-- `geoData` - Testnet peer geolocation data (from testnet25/peers.dat)
+- `geoData` - Testnet peer geolocation data (from testnet26/peers.dat)
 
 ## Data Flow Architecture
 
