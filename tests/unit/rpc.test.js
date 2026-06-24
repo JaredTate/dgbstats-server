@@ -153,6 +153,77 @@ describe('RPC Module', () => {
     });
   });
 
+  describe('sendMainnetPreRpcRequest', () => {
+    test('should make successful modified-mainnet/PRE RPC call on port 14046', async () => {
+      const method = 'getblockchaininfo';
+      const expectedResponse = { ...mockBlockchainInfo, chain: 'main', blocks: 600 };
+
+      mockRpcEnv.mockServer.setResponse(method, expectedResponse);
+
+      expect(typeof rpcModule.sendMainnetPreRpcRequest).toBe('function');
+      const result = await rpcModule.sendMainnetPreRpcRequest(method);
+
+      expect(result).toEqual(expectedResponse);
+      expect(mockedAxios.post).toHaveBeenCalledWith(
+        'http://127.0.0.1:14046',
+        expect.objectContaining({
+          id: 'dgb_mainnet_pre_rpc',
+          method
+        }),
+        expect.objectContaining({
+          auth: {
+            username: 'preminer',
+            password: 'preminerpass'
+          }
+        })
+      );
+    });
+
+    test('should keep modified-mainnet/PRE cache entries separate', async () => {
+      const method = 'getblockchaininfo';
+      mockRpcEnv.mockServer.setResponse(method, { ...mockBlockchainInfo, blocks: 601 });
+
+      await rpcModule.sendMainnetPreRpcRequest(method);
+
+      const cacheKeys = rpcModule.rpcCache.keys();
+      const preKeys = cacheKeys.filter(key => key.startsWith('mainnet-pre:'));
+
+      expect(preKeys.length).toBeGreaterThan(0);
+    });
+
+    test('should not let stuck modified-mainnet/PRE requests block mainnet RPC slots', async () => {
+      const neverResolve = new Promise(() => {});
+
+      mockedAxios.post.mockImplementation((url) => {
+        if (url === 'http://127.0.0.1:14046') {
+          return neverResolve;
+        }
+
+        return Promise.resolve({ data: { result: { ok: true } } });
+      });
+
+      for (let i = 0; i < 4; i += 1) {
+        rpcModule.sendMainnetPreRpcRequest('getblockhash', [i], true);
+      }
+
+      await vi.waitFor(() => {
+        expect(mockedAxios.post.mock.calls.filter(([url]) => url === 'http://127.0.0.1:14046')).toHaveLength(4);
+      });
+
+      const result = await Promise.race([
+        rpcModule.sendRpcRequest('getblockchaininfo', [], true),
+        new Promise(resolve => setTimeout(() => resolve('blocked'), 100))
+      ]);
+
+      expect(result).toEqual({ ok: true });
+      expect(mockedAxios.post).toHaveBeenCalledWith(
+        'http://127.0.0.1:14044',
+        expect.objectContaining({ id: 'dgb_rpc', method: 'getblockchaininfo' }),
+        expect.any(Object)
+      );
+    });
+  });
+
   describe('getAlgoName', () => {
     test('should return correct algorithm names', () => {
       expect(rpcModule.getAlgoName('sha256d')).toBe('SHA256D');

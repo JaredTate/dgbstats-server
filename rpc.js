@@ -47,6 +47,17 @@ const TESTNET_RPC_CONFIG = {
   }
 };
 
+// Modified-mainnet/PRE RPC Connection Settings
+const MAINNET_PRE_RPC_CONFIG = {
+  user: process.env.DGB_MAINNET_PRE_RPC_USER || process.env.DGB_PRE_RPC_USER || 'preminer',
+  password: process.env.DGB_MAINNET_PRE_RPC_PASSWORD || process.env.DGB_PRE_RPC_PASSWORD || 'preminerpass',
+  url: process.env.DGB_MAINNET_PRE_RPC_URL || process.env.DGB_PRE_RPC_URL || 'http://127.0.0.1:14046',
+  timeout: {
+    default: 30000,
+    heavy: 120000
+  }
+};
+
 // Rate Limiting Configuration
 const RATE_LIMIT = {
   maxConcurrent: 4,     // Maximum concurrent RPC requests
@@ -82,7 +93,11 @@ const stats = {
   totalRequests: 0,
   cacheHits: 0,
   cacheMisses: 0,
-  pendingRequests: 0
+  pendingRequests: {
+    mainnet: 0,
+    testnet: 0,
+    mainnetPre: 0
+  }
 };
 
 // ============================================================================
@@ -160,90 +175,13 @@ async function getTransactionData(txid, blockhash = null) {
  * @returns {Promise<any>} RPC response data
  */
 async function sendRpcRequest(method, params = [], skipCache = false) {
-  stats.totalRequests++;
-  
-  try {
-    // Generate unique cache key based on method and parameters
-    const cacheKey = generateCacheKey(method, params);
-    
-    // Check cache first (unless explicitly skipped)
-    if (!skipCache) {
-      const cachedResult = rpcCache.get(cacheKey);
-      if (cachedResult !== undefined) {
-        stats.cacheHits++;
-        return cachedResult;
-      }
-    }
-    
-    // Cache miss - need to make RPC call
-    stats.cacheMisses++;
-    
-    // Apply rate limiting
-    await waitForAvailableSlot();
-    
-    // Track this request
-    stats.pendingRequests++;
-    
-    try {
-      // Configure timeout based on method type
-      const timeout = getTimeoutForMethod(method);
-      
-      // Make the RPC call
-      const response = await axios.post(RPC_CONFIG.url, {
-        jsonrpc: '1.0',
-        id: 'dgb_rpc',
-        method: method,
-        params: params,
-      }, {
-        auth: {
-          username: RPC_CONFIG.user,
-          password: RPC_CONFIG.password,
-        },
-        timeout: timeout,
-      });
-
-      // Release the request slot
-      stats.pendingRequests--;
-
-      // Check for RPC errors
-      if (response.data.error) {
-        throw new Error(`RPC Error: ${JSON.stringify(response.data.error)}`);
-      }
-      
-      const result = response.data.result;
-      
-      // Cache the result with appropriate TTL
-      cacheResultWithSmartTTL(cacheKey, result, method);
-      
-      return result;
-      
-    } catch (requestError) {
-      // Always decrement pending requests on error
-      stats.pendingRequests--;
-      throw requestError;
-    }
-    
-  } catch (error) {
-    console.error(`RPC Error (${method}):`, error.message);
-    
-    // Special handling for known timeout issues
-    if (method === 'gettxoutsetinfo' && error.code === 'ECONNABORTED') {
-      console.log('gettxoutsetinfo timed out - this is normal for this heavy command');
-    }
-    
-    // Try to return stale cached data as fallback
-    const staleResult = attemptStaleDataRecovery(method, params);
-    if (staleResult !== null) {
-      return staleResult;
-    }
-    
-    // For critical methods, return estimated data rather than failing
-    if (method === 'gettxoutsetinfo') {
-      return generateEstimatedUTXOData();
-    }
-    
-    return null;
-  }
+  return sendConfiguredRpcRequest({
+    config: RPC_CONFIG,
+    networkName: 'Mainnet',
+    rpcId: 'dgb_rpc',
+    cachePrefix: '',
+    limiterKey: 'mainnet'
+  }, method, params, skipCache);
 }
 
 /**
@@ -261,11 +199,36 @@ async function sendRpcRequest(method, params = [], skipCache = false) {
  * @returns {Promise<any>} RPC response data
  */
 async function sendTestnetRpcRequest(method, params = [], skipCache = false) {
+  return sendConfiguredRpcRequest({
+    config: TESTNET_RPC_CONFIG,
+    networkName: 'Testnet',
+    rpcId: 'dgb_testnet_rpc',
+    cachePrefix: 'testnet:',
+    limiterKey: 'testnet'
+  }, method, params, skipCache);
+}
+
+/**
+ * Enhanced RPC request function for the modified-mainnet/PRE rehearsal node.
+ *
+ * This is intentionally separate from normal mainnet. The PRE node still
+ * reports chain=main, but it runs on its own RPC port and cache namespace.
+ */
+async function sendMainnetPreRpcRequest(method, params = [], skipCache = false) {
+  return sendConfiguredRpcRequest({
+    config: MAINNET_PRE_RPC_CONFIG,
+    networkName: 'Mainnet-PRE',
+    rpcId: 'dgb_mainnet_pre_rpc',
+    cachePrefix: 'mainnet-pre:',
+    limiterKey: 'mainnetPre'
+  }, method, params, skipCache);
+}
+
+async function sendConfiguredRpcRequest(target, method, params = [], skipCache = false) {
   stats.totalRequests++;
 
   try {
-    // Generate unique cache key based on method and parameters (with testnet prefix)
-    const cacheKey = 'testnet:' + generateCacheKey(method, params);
+    const cacheKey = target.cachePrefix + generateCacheKey(method, params);
 
     // Check cache first (unless explicitly skipped)
     if (!skipCache) {
@@ -280,35 +243,32 @@ async function sendTestnetRpcRequest(method, params = [], skipCache = false) {
     stats.cacheMisses++;
 
     // Apply rate limiting
-    await waitForAvailableSlot();
+    const limiterKey = target.limiterKey || 'mainnet';
+    await waitForAvailableSlot(limiterKey);
 
     // Track this request
-    stats.pendingRequests++;
+    stats.pendingRequests[limiterKey]++;
 
     try {
       // Configure timeout based on method type
       const timeout = getTimeoutForMethod(method);
 
-      // Make the RPC call to testnet
-      const response = await axios.post(TESTNET_RPC_CONFIG.url, {
+      const response = await axios.post(target.config.url, {
         jsonrpc: '1.0',
-        id: 'dgb_testnet_rpc',
+        id: target.rpcId,
         method: method,
         params: params,
       }, {
         auth: {
-          username: TESTNET_RPC_CONFIG.user,
-          password: TESTNET_RPC_CONFIG.password,
+          username: target.config.user,
+          password: target.config.password,
         },
         timeout: timeout,
       });
 
-      // Release the request slot
-      stats.pendingRequests--;
-
       // Check for RPC errors
       if (response.data.error) {
-        throw new Error(`Testnet RPC Error: ${JSON.stringify(response.data.error)}`);
+        throw new Error(`${target.networkName} RPC Error: ${JSON.stringify(response.data.error)}`);
       }
 
       const result = response.data.result;
@@ -318,22 +278,20 @@ async function sendTestnetRpcRequest(method, params = [], skipCache = false) {
 
       return result;
 
-    } catch (requestError) {
-      // Always decrement pending requests on error
-      stats.pendingRequests--;
-      throw requestError;
+    } finally {
+      stats.pendingRequests[limiterKey]--;
     }
 
   } catch (error) {
-    console.error(`Testnet RPC Error (${method}):`, error.message);
+    console.error(`${target.networkName} RPC Error (${method}):`, error.message);
 
     // Special handling for known timeout issues
     if (method === 'gettxoutsetinfo' && error.code === 'ECONNABORTED') {
-      console.log('Testnet gettxoutsetinfo timed out - this is normal for this heavy command');
+      console.log(`${target.networkName} gettxoutsetinfo timed out - this is normal for this heavy command`);
     }
 
     // Try to return stale cached data as fallback
-    const staleResult = attemptStaleDataRecovery(method, params);
+    const staleResult = attemptStaleDataRecovery(method, params, target.cachePrefix);
     if (staleResult !== null) {
       return staleResult;
     }
@@ -365,10 +323,10 @@ function generateCacheKey(method, params) {
  * Apply rate limiting by waiting for available request slots
  * Uses exponential backoff to prevent thundering herd
  */
-async function waitForAvailableSlot() {
+async function waitForAvailableSlot(limiterKey = 'mainnet') {
   let waitTime = 100; // Start with 100ms
   
-  while (stats.pendingRequests >= RATE_LIMIT.maxConcurrent) {
+  while ((stats.pendingRequests[limiterKey] || 0) >= RATE_LIMIT.maxConcurrent) {
     await new Promise(resolve => setTimeout(resolve, waitTime));
     waitTime = Math.min(waitTime * 1.1, 1000); // Cap at 1 second
   }
@@ -416,8 +374,8 @@ function cacheResultWithSmartTTL(cacheKey, result, method) {
  * @param {Array} params - Method parameters
  * @returns {any|null} Stale cached data or null
  */
-function attemptStaleDataRecovery(method, params) {
-  const cacheKey = generateCacheKey(method, params);
+function attemptStaleDataRecovery(method, params, cachePrefix = '') {
+  const cacheKey = cachePrefix + generateCacheKey(method, params);
   const staleResult = rpcCache.get(cacheKey, true); // Get even if expired
   
   if (staleResult !== undefined) {
@@ -799,6 +757,7 @@ function getCacheStats() {
   const hitRate = stats.totalRequests > 0 
     ? (stats.cacheHits / stats.totalRequests * 100).toFixed(1) + '%' 
     : '0%';
+  const pendingRequestsByTarget = { ...stats.pendingRequests };
     
   return {
     keys: rpcCache.keys().length,
@@ -806,7 +765,8 @@ function getCacheStats() {
     misses: stats.cacheMisses,
     total: stats.totalRequests,
     hitRate: hitRate,
-    pendingRequests: stats.pendingRequests
+    pendingRequests: Object.values(pendingRequestsByTarget).reduce((sum, count) => sum + count, 0),
+    pendingRequestsByTarget
   };
 }
 
@@ -1141,112 +1101,106 @@ router.get('/testnet/getlatestblock', async (req, res) => {
 });
 
 // ============================================================================
-// DIGIDOLLAR API ENDPOINTS (TESTNET ONLY)
+// DIGIDOLLAR API ENDPOINTS
 // ============================================================================
 
-/**
- * Get DigiDollar system-wide statistics
- * Returns health, collateral, supply, and tier information
- */
-router.get('/testnet/getdigidollarstats', async (req, res) => {
-  try {
-    const data = await sendTestnetRpcRequest('getdigidollarstats');
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/getdigidollarstats:', error);
-    res.status(500).json({ error: 'Error fetching DigiDollar stats', details: error.message });
-  }
-});
+function routePath(prefix, endpoint) {
+  return prefix ? `${prefix}${endpoint}` : endpoint;
+}
 
-/**
- * Get current oracle price data
- * Returns price in micro-USD format and status
- */
-router.get('/testnet/getoracleprice', async (req, res) => {
-  try {
-    const data = await sendTestnetRpcRequest('getoracleprice');
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/getoracleprice:', error);
-    res.status(500).json({ error: 'Error fetching oracle price', details: error.message });
-  }
-});
+function clampSignerBlockCount(value) {
+  const requestedBlocks = Number.parseInt(value || '100', 10);
+  return Number.isFinite(requestedBlocks)
+    ? Math.max(1, Math.min(1000, requestedBlocks))
+    : 100;
+}
 
-/**
- * Get network-wide view of ALL oracles
- * Returns array of oracle info with names, pubkeys, endpoints, prices, and status
- * This is the primary endpoint for the oracle network page
- */
-router.get('/testnet/getoracles', async (req, res) => {
-  try {
-    const data = await sendTestnetRpcRequest('getoracles');
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/getoracles:', error);
-    res.status(500).json({ error: 'Error fetching oracles', details: error.message });
-  }
-});
+function registerDigiDollarRoutes(prefix, sendRequest, label) {
+  router.get(routePath(prefix, '/getdigidollardeploymentinfo'), async (req, res) => {
+    try {
+      const data = await sendRequest('getdigidollardeploymentinfo');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getdigidollardeploymentinfo')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} DigiDollar deployment info`, details: error.message });
+    }
+  });
 
-/**
- * Get detailed per-oracle price breakdown (forensics view)
- * Returns each oracle's exact price, deviation from median, signature validity
- * Use this to catch anyone gaming the system
- */
-router.get('/testnet/getalloracleprices', async (req, res) => {
-  try {
-    const data = await sendTestnetRpcRequest('getalloracleprices');
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/getalloracleprices:', error);
-    res.status(500).json({ error: 'Error fetching all oracle prices', details: error.message });
-  }
-});
+  router.get(routePath(prefix, '/getdigidollarstats'), async (req, res) => {
+    try {
+      const data = await sendRequest('getdigidollarstats');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getdigidollarstats')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} DigiDollar stats`, details: error.message });
+    }
+  });
 
-/**
- * Get recent MuSig2 oracle bundle signers
- * Returns exact oracle IDs that signed each recent on-chain bundle
- */
-router.get('/testnet/getoraclesigners', async (req, res) => {
-  try {
-    const requestedBlocks = Number.parseInt(req.query.blocks || '100', 10);
-    const blocks = Number.isFinite(requestedBlocks)
-      ? Math.max(1, Math.min(1000, requestedBlocks))
-      : 100;
-    const data = await sendTestnetRpcRequest('getoraclesigners', [blocks]);
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/getoraclesigners:', error);
-    res.status(500).json({ error: 'Error fetching oracle bundle signers', details: error.message });
-  }
-});
+  router.get(routePath(prefix, '/getoracleprice'), async (req, res) => {
+    try {
+      const data = await sendRequest('getoracleprice');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getoracleprice')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} oracle price`, details: error.message });
+    }
+  });
 
-/**
- * Get local oracle status (is your local oracle running?)
- * Returns status of oracle running on THIS node
- */
-router.get('/testnet/listoracle', async (req, res) => {
-  try {
-    const data = await sendTestnetRpcRequest('listoracle');
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/listoracle:', error);
-    res.status(500).json({ error: 'Error fetching local oracle status', details: error.message });
-  }
-});
+  router.get(routePath(prefix, '/getoracles'), async (req, res) => {
+    try {
+      const data = await sendRequest('getoracles');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getoracles')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} oracles`, details: error.message });
+    }
+  });
 
-/**
- * Get DigiDollar protection system status
- * Returns DCA, ERR, and volatility protection status
- */
-router.get('/testnet/getprotectionstatus', async (req, res) => {
-  try {
-    const data = await sendTestnetRpcRequest('getprotectionstatus');
-    res.json(data);
-  } catch (error) {
-    console.error('Error in /api/testnet/getprotectionstatus:', error);
-    res.status(500).json({ error: 'Error fetching protection status', details: error.message });
-  }
-});
+  router.get(routePath(prefix, '/getalloracleprices'), async (req, res) => {
+    try {
+      const data = await sendRequest('getalloracleprices');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getalloracleprices')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} all oracle prices`, details: error.message });
+    }
+  });
+
+  router.get(routePath(prefix, '/getoraclesigners'), async (req, res) => {
+    try {
+      const blocks = clampSignerBlockCount(req.query.blocks);
+      const data = await sendRequest('getoraclesigners', [blocks]);
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getoraclesigners')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} oracle bundle signers`, details: error.message });
+    }
+  });
+
+  router.get(routePath(prefix, '/listoracle'), async (req, res) => {
+    try {
+      const data = await sendRequest('listoracle');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/listoracle')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} local oracle status`, details: error.message });
+    }
+  });
+
+  router.get(routePath(prefix, '/getprotectionstatus'), async (req, res) => {
+    try {
+      const data = await sendRequest('getprotectionstatus');
+      res.json(data);
+    } catch (error) {
+      console.error(`Error in /api${routePath(prefix, '/getprotectionstatus')}:`, error);
+      res.status(500).json({ error: `Error fetching ${label} protection status`, details: error.message });
+    }
+  });
+}
+
+registerDigiDollarRoutes('', sendRpcRequest, 'mainnet');
+registerDigiDollarRoutes('/testnet', sendTestnetRpcRequest, 'testnet');
+registerDigiDollarRoutes('/mainnet-pre', sendMainnetPreRpcRequest, 'mainnet-pre');
 
 // ============================================================================
 // MODULE EXPORTS
@@ -1256,6 +1210,7 @@ module.exports = {
   router,
   sendRpcRequest,
   sendTestnetRpcRequest,
+  sendMainnetPreRpcRequest,
   getTransactionData,
   getAlgoName,
   getBlocksByTimeRange,

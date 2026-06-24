@@ -60,8 +60,9 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     expect(serverContents).toContain("sendTestnetRpcRequest('getoracles'");
     expect(serverContents).toContain("sendTestnetRpcRequest('getoraclesigners'");
     expect(serverContents).toContain("sendTestnetRpcRequest('getdigidollardeploymentinfo'");
-    expect(rpcContents).toContain("sendTestnetRpcRequest('getoraclesigners'");
-    expect(rpcContents).toContain("sendTestnetRpcRequest('getprotectionstatus'");
+    expect(rpcContents).toContain("registerDigiDollarRoutes('/testnet', sendTestnetRpcRequest, 'testnet')");
+    expect(rpcContents).toContain("getoraclesigners");
+    expect(rpcContents).toContain("getprotectionstatus");
   });
 
   test('testnet defaults match current testnet26 ports and peer path', () => {
