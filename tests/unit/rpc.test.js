@@ -233,6 +233,14 @@ describe('RPC Module', () => {
       expect(rpcModule.getAlgoName('odo')).toBe('Odo');
     });
 
+    test('should identify the retired Myriad-Groestl algorithm (DigiByte node returns pow_algo "groestl")', () => {
+      // DigiByte's ALGO_GROESTL is Myriad-Groestl (groestl512 -> sha256). It was
+      // retired at Odocrypt but is being mined again during the v9.26.2 incident;
+      // blocks must be labelled "Myriad-Groestl", not "Unknown".
+      expect(rpcModule.getAlgoName('groestl')).toBe('Myriad-Groestl');
+      expect(rpcModule.getAlgoName('groestlsha2')).toBe('Myriad-Groestl');
+    });
+
     test('should return Unknown for invalid algorithm', () => {
       expect(rpcModule.getAlgoName('invalid')).toBe('Unknown');
       expect(rpcModule.getAlgoName('')).toBe('Unknown');

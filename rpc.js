@@ -419,12 +419,18 @@ function generateEstimatedUTXOData() {
 function getAlgoName(algo) {
   const algorithms = {
     'sha256d': 'SHA256D',
-    'scrypt': 'Scrypt', 
+    'scrypt': 'Scrypt',
     'skein': 'Skein',
     'qubit': 'Qubit',
-    'odo': 'Odo'
+    'odo': 'Odo',
+    // DigiByte's ALGO_GROESTL is Myriad-Groestl (Groestl-512 -> SHA256, aka
+    // "groestlsha2"). It was retired at the Odocrypt fork (2019) but the node still
+    // reports pow_algo "groestl" for blocks mined on it (e.g. the v9.26.2 incident).
+    // Label it correctly rather than falling through to "Unknown".
+    'groestl': 'Myriad-Groestl',
+    'groestlsha2': 'Myriad-Groestl'
   };
-  
+
   return algorithms[algo] || 'Unknown';
 }
 
@@ -796,6 +802,18 @@ router.get('/getblockchaininfo', async (req, res) => {
   }
 });
 
+// Authoritative BIP9 deployment status (used by the Pool Upgrade Tracker for the
+// official `algolock` signalling window stats alongside the per-pool heuristic).
+router.get('/getdeploymentinfo', async (req, res) => {
+  try {
+    const data = await sendRpcRequest('getdeploymentinfo');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/getdeploymentinfo:', error);
+    res.status(500).json({ error: 'Error fetching deployment info' });
+  }
+});
+
 // Peer information with geolocation data
 router.get('/getpeerinfo', async (req, res) => {
   try {
@@ -964,6 +982,17 @@ router.get('/testnet/getblockchaininfo', async (req, res) => {
   } catch (error) {
     console.error('Error in /api/testnet/getblockchaininfo:', error);
     res.status(500).json({ error: 'Error fetching testnet blockchain info' });
+  }
+});
+
+// Testnet BIP9 deployment status
+router.get('/testnet/getdeploymentinfo', async (req, res) => {
+  try {
+    const data = await sendTestnetRpcRequest('getdeploymentinfo');
+    res.json(data);
+  } catch (error) {
+    console.error('Error in /api/testnet/getdeploymentinfo:', error);
+    res.status(500).json({ error: 'Error fetching testnet deployment info' });
   }
 });
 
