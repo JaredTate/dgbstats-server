@@ -476,6 +476,29 @@ function classifyBlockVersion(version) {
   };
 }
 
+/**
+ * Merge freshly fetched blocks with blocks already in the cache.
+ *
+ * The 60s refresh can complete with a slightly stale view of the tip while
+ * ZMQ/blocknotify have already delivered newer blocks — merging (instead of
+ * clobbering) guarantees the cache never regresses. Dedupes by hash with the
+ * freshly fetched copy winning, sorts newest-first, caps at maxBlocks.
+ *
+ * @param {Array} existing - Blocks currently in the cache
+ * @param {Array} fetched - Blocks returned by the refresh
+ * @param {number} maxBlocks - Cache size cap
+ * @returns {Array} Merged, deduped, newest-first block list
+ */
+function mergeRecentBlocks(existing, fetched, maxBlocks) {
+  const byHash = new Map();
+  for (const block of [...(existing || []), ...(fetched || [])]) {
+    if (block && block.hash) byHash.set(block.hash, block);
+  }
+  return Array.from(byHash.values())
+    .sort((a, b) => b.height - a.height)
+    .slice(0, maxBlocks);
+}
+
 // ============================================================================
 // ADVANCED BLOCK FETCHING
 // ============================================================================
@@ -1313,6 +1336,7 @@ module.exports = {
   getAlgoName,
   classifyBlockVersion,
   extractPoolIdentifier,
+  mergeRecentBlocks,
   getBlocksByTimeRange,
   preloadEssentialData,
   getCacheStats,

@@ -43,6 +43,7 @@ const {
   getAlgoName,
   classifyBlockVersion,
   extractPoolIdentifier,
+  mergeRecentBlocks,
   getBlocksByTimeRange
 } = require('./rpc');
 
@@ -923,36 +924,40 @@ async function fetchLatestBlocks() {
     const latestBlockHeight = blockchainInfo.blocks;
     console.log(`Current blockchain height: ${latestBlockHeight}`);
 
-    // Clear existing blocks to prevent duplicates
+    // Snapshot the current cache: blocks delivered by ZMQ/blocknotify while
+    // this refresh runs (or fetched by the previous refresh) must survive a
+    // slightly-stale range fetch — never let the tip regress.
+    const previousBlocks = [...recentBlocks];
     recentBlocks.length = 0;
-    
+
     // Request more blocks than needed (10% buffer)
     const requestedBlocks = Math.ceil(SERVER_CONFIG.maxRecentBlocks * 1.1);
-    
+
     // Fetch blocks using optimized batch processing
     console.log(`Requesting ${requestedBlocks} blocks from height ${latestBlockHeight}`);
     const fetchedBlocks = await getBlocksByTimeRange(0, latestBlockHeight, requestedBlocks);
-    
+
     // Add fetched blocks to our cache
     recentBlocks.push(...fetchedBlocks);
-    
+
     // If we don't have enough blocks, fetch additional ones individually
     await fillRemainingBlocks(latestBlockHeight);
 
-    // Dedupe by hash — the batch fetch, gap fill, and any ZMQ/blocknotify
-    // arrivals during the refresh can each contribute the same block.
-    const seenHashes = new Set();
-    const dedupedBlocks = recentBlocks.filter(b => b && b.hash && !seenHashes.has(b.hash) && !!seenHashes.add(b.hash));
+    // Merge with the snapshot: dedupe by hash (fresh copy wins), newest first,
+    // capped at the cache size.
+    const merged = mergeRecentBlocks(previousBlocks, recentBlocks, SERVER_CONFIG.maxRecentBlocks);
     recentBlocks.length = 0;
-    recentBlocks.push(...dedupedBlocks);
+    recentBlocks.push(...merged);
 
-    // Sort and limit to exact count
-    recentBlocks.sort((a, b) => b.height - a.height);
-    recentBlocks.splice(SERVER_CONFIG.maxRecentBlocks);
-    
     console.log(`Block cache updated: ${recentBlocks.length} blocks loaded`);
     console.log(`Height range: ${recentBlocks[0]?.height || 'none'} to ${recentBlocks[recentBlocks.length-1]?.height || 'none'}`);
-    
+
+    // Push the refreshed list to connected clients whenever the tip moved.
+    // Without ZMQ/blocknotify on the node this refresh is the ONLY source of
+    // new blocks, and clients that connected during cache warm-up would
+    // otherwise stay starved forever (they only get recentBlocks on connect).
+    broadcastRecentBlocksIfChanged();
+
     return recentBlocks;
   } catch (error) {
     console.error('Error fetching latest blocks:', error);
@@ -1220,10 +1225,42 @@ async function handleTransactionLifecycle(fullBlock) {
  * 
  * @param {object} newBlock - New block data
  */
+// Newest hash included in the last recentBlocks broadcast (or connect-time
+// sends happen independently); used to skip redundant rebroadcasts.
+let lastBroadcastTipHash = null;
+
+/**
+ * Broadcast the full recentBlocks list to every connected mainnet client when
+ * the cache tip has changed since the last broadcast. This keeps pages live
+ * even when the node has no ZMQ/blocknotify push configured, and heals
+ * clients that connected while the cache was still warming up.
+ */
+function broadcastRecentBlocksIfChanged() {
+  const tipHash = recentBlocks[0]?.hash || null;
+  if (!tipHash || tipHash === lastBroadcastTipHash) return;
+  lastBroadcastTipHash = tipHash;
+
+  const message = JSON.stringify({ type: 'recentBlocks', data: recentBlocks });
+  let sent = 0;
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+        sent++;
+      } catch (error) {
+        console.error('Error broadcasting recentBlocks to client:', error);
+      }
+    }
+  });
+  if (sent > 0) {
+    console.log(`recentBlocks (tip ${recentBlocks[0]?.height}) rebroadcast to ${sent} clients`);
+  }
+}
+
 function broadcastNewBlock(newBlock) {
-  const message = JSON.stringify({ 
-    type: 'newBlock', 
-    data: newBlock 
+  const message = JSON.stringify({
+    type: 'newBlock',
+    data: newBlock
   });
 
   wss.clients.forEach((client) => {
@@ -1548,7 +1585,9 @@ async function fetchTestnetLatestBlocks() {
     const latestBlockHeight = blockchainInfo.blocks;
     console.log(`Testnet current blockchain height: ${latestBlockHeight}`);
 
-    // Clear existing blocks to prevent duplicates
+    // Snapshot the current cache so blocknotify-delivered blocks survive a
+    // slightly-stale refresh (same merge semantics as mainnet).
+    const previousBlocks = [...testnetRecentBlocks];
     testnetRecentBlocks.length = 0;
 
     // Fetch blocks individually for testnet (simpler approach)
@@ -1566,13 +1605,19 @@ async function fetchTestnetLatestBlocks() {
       }
     }
 
-    // Sort by height descending
-    testnetRecentBlocks.sort((a, b) => b.height - a.height);
+    // Merge with the snapshot: dedupe by hash, newest first, capped.
+    const merged = mergeRecentBlocks(previousBlocks, testnetRecentBlocks, SERVER_CONFIG.maxRecentBlocks);
+    testnetRecentBlocks.length = 0;
+    testnetRecentBlocks.push(...merged);
 
     console.log(`Testnet block cache updated: ${testnetRecentBlocks.length} blocks loaded`);
     if (testnetRecentBlocks.length > 0) {
       console.log(`Testnet height range: ${testnetRecentBlocks[0]?.height || 'none'} to ${testnetRecentBlocks[testnetRecentBlocks.length-1]?.height || 'none'}`);
     }
+
+    // Keep testnet pages live even without blocknotify, and heal clients that
+    // connected during warm-up.
+    broadcastTestnetRecentBlocksIfChanged();
 
     return testnetRecentBlocks;
   } catch (error) {
@@ -1646,6 +1691,32 @@ function updateTestnetRecentBlocksCache(newBlock) {
  *
  * @param {object} newBlock - New block data
  */
+// Newest hash included in the last testnet recentBlocks broadcast.
+let lastTestnetBroadcastTipHash = null;
+
+/** Testnet twin of broadcastRecentBlocksIfChanged(). */
+function broadcastTestnetRecentBlocksIfChanged() {
+  const tipHash = testnetRecentBlocks[0]?.hash || null;
+  if (!tipHash || tipHash === lastTestnetBroadcastTipHash) return;
+  lastTestnetBroadcastTipHash = tipHash;
+
+  const message = JSON.stringify({ type: 'recentBlocks', data: testnetRecentBlocks });
+  let sent = 0;
+  wssTestnet.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+        sent++;
+      } catch (error) {
+        console.error('Testnet: Error broadcasting recentBlocks to client:', error);
+      }
+    }
+  });
+  if (sent > 0) {
+    console.log(`Testnet recentBlocks (tip ${testnetRecentBlocks[0]?.height}) rebroadcast to ${sent} clients`);
+  }
+}
+
 function broadcastTestnetNewBlock(newBlock) {
   const message = JSON.stringify({
     type: 'newBlock',
