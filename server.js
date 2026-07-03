@@ -41,6 +41,8 @@ const {
   sendMainnetPreRpcRequest,
   getTransactionData,
   getAlgoName,
+  classifyBlockVersion,
+  extractPoolIdentifier,
   getBlocksByTimeRange
 } = require('./rpc');
 
@@ -877,39 +879,20 @@ async function sendMempoolDataToClient(ws) {
  */
 function decodeCoinbaseData(coinbaseHex) {
   try {
-    const buffer = Buffer.from(coinbaseHex, 'hex');
-    const text = buffer.toString('utf8');
+    const text = Buffer.from(coinbaseHex, 'hex').toString('utf8');
 
-    // Common mining pool identifier patterns
-    const poolPatterns = [
-      /\/(.*?)\//,                    // Format: /PoolName/
-      /\[(.*?)\]/,                    // Format: [PoolName]
-      /@(.*?)@/,                      // Format: @PoolName@
-      /pool\.(.*?)\.com/,             // Format: pool.Name.com
-      /(.*?)pool/i,                   // Format: Somethingpool
-      /^(?:[\x00-\xFF]*?)([\x20-\x7F]{3,})/ // Fallback: readable ASCII
-    ];
-
-    let poolIdentifier = 'Unknown';
-    
-    // Try each pattern until we find a match
-    for (const pattern of poolPatterns) {
-      const match = text.match(pattern);
-      if (match && match[1] && match[1].length >= 3) {
-        poolIdentifier = match[1].trim();
-        break;
-      }
-    }
-
-    return { 
-      poolIdentifier, 
+    // Shared extractor (rpc.js) — printable-tag, domain, and readable-run rules
+    // that never leak binary extranonce bytes into the identifier. Blocks with
+    // no readable tag return 'Unknown' so consumers group by payout address.
+    return {
+      poolIdentifier: extractPoolIdentifier(coinbaseHex),
       rawText: text.substring(0, 100) // Limit raw text length
     };
   } catch (error) {
     console.error('Error decoding coinbase data:', error);
-    return { 
-      poolIdentifier: 'Unknown', 
-      rawText: '' 
+    return {
+      poolIdentifier: 'Unknown',
+      rawText: ''
     };
   }
 }
@@ -955,6 +938,13 @@ async function fetchLatestBlocks() {
     
     // If we don't have enough blocks, fetch additional ones individually
     await fillRemainingBlocks(latestBlockHeight);
+
+    // Dedupe by hash — the batch fetch, gap fill, and any ZMQ/blocknotify
+    // arrivals during the refresh can each contribute the same block.
+    const seenHashes = new Set();
+    const dedupedBlocks = recentBlocks.filter(b => b && b.hash && !seenHashes.has(b.hash) && !!seenHashes.add(b.hash));
+    recentBlocks.length = 0;
+    recentBlocks.push(...dedupedBlocks);
 
     // Sort and limit to exact count
     recentBlocks.sort((a, b) => b.height - a.height);
@@ -1025,8 +1015,7 @@ async function fetchSingleBlockForCache(height) {
   const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
   
   const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
-  const taprootSignaling = (block.version & (1 << 2)) !== 0;
-  
+
   return {
     height: block.height,
     hash: block.hash,
@@ -1037,7 +1026,7 @@ async function fetchSingleBlockForCache(height) {
     minedTo: minerAddress,
     minerAddress,
     poolIdentifier,
-    taprootSignaling,
+    ...classifyBlockVersion(block.version),
     version: block.version
   };
 }
@@ -1076,7 +1065,6 @@ app.post('/api/blocknotify', async (req, res) => {
     const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
 
     const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
-    const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
 
     // Create standardized block object
     const newBlock = {
@@ -1089,7 +1077,7 @@ app.post('/api/blocknotify', async (req, res) => {
       minedTo: minerAddress,
       minerAddress,
       poolIdentifier,
-      taprootSignaling,
+      ...classifyBlockVersion(fullBlock.version),
       version: fullBlock.version
     };
 
@@ -1117,12 +1105,18 @@ app.post('/api/blocknotify', async (req, res) => {
  * @param {object} newBlock - New block data
  */
 function updateRecentBlocksCache(newBlock) {
-  // Add to front of array
-  recentBlocks.unshift(newBlock);
-  
+  // Dedupe: the same block can arrive via both ZMQ rawblock and blocknotify,
+  // or race the 60s cache refresh — keep exactly one entry per hash.
+  const existingIndex = recentBlocks.findIndex(b => b.hash === newBlock.hash);
+  if (existingIndex !== -1) {
+    recentBlocks[existingIndex] = newBlock;
+  } else {
+    recentBlocks.unshift(newBlock);
+  }
+
   // Sort by height to ensure proper ordering
   recentBlocks.sort((a, b) => b.height - a.height);
-  
+
   // Maintain maximum size
   recentBlocks.splice(SERVER_CONFIG.maxRecentBlocks);
 }
@@ -1279,7 +1273,6 @@ app.post('/api/testnet/blocknotify', async (req, res) => {
     const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
 
     const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
-    const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
 
     // Create standardized block object
     const newBlock = {
@@ -1292,7 +1285,7 @@ app.post('/api/testnet/blocknotify', async (req, res) => {
       minedTo: minerAddress,
       minerAddress,
       poolIdentifier,
-      taprootSignaling,
+      ...classifyBlockVersion(fullBlock.version),
       version: fullBlock.version
     };
 
@@ -1609,7 +1602,6 @@ async function fetchSingleTestnetBlockForCache(height) {
   const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
 
   const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
-  const taprootSignaling = (block.version & (1 << 2)) !== 0;
 
   return {
     height: block.height,
@@ -1621,7 +1613,7 @@ async function fetchSingleTestnetBlockForCache(height) {
     minedTo: minerAddress,
     minerAddress,
     poolIdentifier,
-    taprootSignaling,
+    ...classifyBlockVersion(block.version),
     version: block.version
   };
 }
@@ -4033,8 +4025,7 @@ async function handleRawBlocks() {
         const minerAddress = addressOutput ? addressOutput.scriptPubKey.address : '';
         
         const { poolIdentifier } = decodeCoinbaseData(coinbaseTx.vin[0].coinbase);
-        const taprootSignaling = (fullBlock.version & (1 << 2)) !== 0;
-        
+
         const newBlock = {
           height: fullBlock.height,
           hash: fullBlock.hash,
@@ -4045,7 +4036,7 @@ async function handleRawBlocks() {
           minedTo: minerAddress,
           minerAddress,
           poolIdentifier,
-          taprootSignaling,
+          ...classifyBlockVersion(fullBlock.version),
           version: fullBlock.version
         };
         

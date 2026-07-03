@@ -32,3 +32,6 @@ config.js
 # cache files
 cache-backup.json
 *.log
+
+# Local RPC credentials
+.env

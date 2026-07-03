@@ -435,6 +435,48 @@ function getAlgoName(algo) {
 }
 
 // ============================================================================
+// BLOCK VERSION / BIP9 SIGNAL CLASSIFICATION
+// ============================================================================
+
+// DigiByte block nVersion layout: top bits 001 (0x20000000) mark a BIP9 version;
+// the mining algo lives in the nibble at bits 8-11 (scrypt=0x0, sha256d=0x2,
+// groestl=0x4, skein=0x6, qubit=0x8, odo=0xE); the low byte carries the base
+// version (bit 1) plus the low BIP9 bits (algolock=bit 0, taproot=bit 2).
+// SHA256D ASICs version-roll bits 13-28 (BIP310/BIP320 mask 0x1fffe000), which
+// INCLUDES the DigiDollar bit 23 — so bit 23 on a rolled block is a coin flip.
+// Consensus (versionbits.cpp Condition()) counts the RAW bit regardless of
+// rolling, so digidollarSignaling mirrors exactly what the node counts, and
+// versionRolled lets clients decide how much to trust it as an upgrade signal.
+// Algolock bit 0 sits OUTSIDE the roll window and is always trustworthy.
+// NOTE: DigiByte's VERSIONBITS_TOP_MASK is 0xF0000000 (versionbits.h:18), NOT
+// Bitcoin's 0xE0000000 — a block with rolled bit 28 set signals NOTHING.
+const VERSION_TOP_MASK = 0xf0000000;
+const VERSION_TOP_BITS = 0x20000000;
+const VERSION_STRUCTURAL_MASK = VERSION_TOP_BITS | 0x00000f00 | 0x000000ff;
+const VERSION_BIT_ALGOLOCK = 1 << 0;
+const VERSION_BIT_TAPROOT = 1 << 2;
+const VERSION_BIT_DIGIDOLLAR = 1 << 23;
+
+function classifyBlockVersion(version) {
+  if (typeof version !== 'number' || !Number.isFinite(version)) {
+    return { taprootSignaling: false, digidollarSignaling: false, algolockSignaling: false, versionRolled: false };
+  }
+  const v = version >>> 0;
+  const top = (v & VERSION_TOP_MASK) === VERSION_TOP_BITS;
+  // Rolled detection uses the looser 001x shape (0xE0000000): a rolled block
+  // whose bit 28 landed on 1 fails the consensus top-mask but is still very
+  // much a version-rolled block and must be reported as such.
+  const bip9Era = (v & 0xe0000000) === VERSION_TOP_BITS;
+  const residual = (v & ~VERSION_STRUCTURAL_MASK & ~VERSION_BIT_DIGIDOLLAR) >>> 0;
+  return {
+    taprootSignaling: top && (v & VERSION_BIT_TAPROOT) !== 0,
+    digidollarSignaling: top && (v & VERSION_BIT_DIGIDOLLAR) !== 0,
+    algolockSignaling: top && (v & VERSION_BIT_ALGOLOCK) !== 0,
+    versionRolled: bip9Era && residual !== 0,
+  };
+}
+
+// ============================================================================
 // ADVANCED BLOCK FETCHING
 // ============================================================================
 
@@ -582,10 +624,10 @@ async function processBlockForStats(blockHash) {
     
     // Extract mining information from coinbase transaction
     const miningInfo = extractMiningInfo(block.tx[0]);
-    
-    // Detect Taproot signaling (BIP 341)
-    const taprootSignaling = (block.version & (1 << 2)) !== 0;
-    
+
+    // Classify BIP9 signaling bits (taproot bit 2, digidollar bit 23, algolock bit 0)
+    const signals = classifyBlockVersion(block.version);
+
     return {
       height: block.height,
       hash: block.hash,
@@ -596,7 +638,10 @@ async function processBlockForStats(blockHash) {
       minedTo: miningInfo.address,
       minerAddress: miningInfo.address,
       poolIdentifier: miningInfo.poolId,
-      taprootSignaling: taprootSignaling,
+      taprootSignaling: signals.taprootSignaling,
+      digidollarSignaling: signals.digidollarSignaling,
+      algolockSignaling: signals.algolockSignaling,
+      versionRolled: signals.versionRolled,
       version: block.version
     };
     
@@ -638,24 +683,48 @@ function extractMiningInfo(coinbaseTx) {
  */
 function extractPoolIdentifier(coinbaseHex) {
   try {
-    const decodedText = Buffer.from(coinbaseHex, 'hex').toString('utf8', 0, 100);
-    
-    // Common pool identifier patterns
-    const patterns = [
-      /\/(.*?)\//,                    // /PoolName/
-      /\[(.*?)\]/,                    // [PoolName]
-      /@(.*?)@/,                      // @PoolName@
-      /pool\.(.*?)\.com/i,            // pool.Name.com
-      /(.*?)pool/i,                   // Namepool
+    const text = Buffer.from(coinbaseHex, 'hex').toString('utf8', 0, 120);
+
+    // 1. Explicit tag formats — content must be printable ASCII with a letter,
+    //    so binary extranonce bytes can't leak into the identifier.
+    const tagged = [
+      /\/([\x20-\x7E]{3,40}?)\//,     // /PoolName/
+      /\[([\x20-\x7E]{3,40}?)\]/,     // [PoolName]
+      /@([\x20-\x7E]{3,40}?)@/,       // @PoolName@
     ];
-    
-    for (const pattern of patterns) {
-      const match = decodedText.match(pattern);
-      if (match && match[1] && match[1].length > 2) {
-        return match[1].trim();
-      }
+    for (const pattern of tagged) {
+      const match = text.match(pattern);
+      if (match && /[A-Za-z]/.test(match[1])) return match[1].trim();
     }
-    
+
+    // 2. Bare domain names (solopool.org, m2pool.com, zpool.ca, letsmine.it, ...).
+    //    The TLD alternation stops the match before stray printable bytes that
+    //    trail the tag ("solopool.orgH" -> "solopool.org").
+    const DOMAIN_RE = /([a-z0-9][a-z0-9-]{0,40}(?:\.[a-z0-9][a-z0-9-]{0,40})*\.(?:com|org|net|io|ca|it|ru|de|uk|eu|info|pro|xyz|top|club|site|pool|space|cloud|dev|me|cc|tv|us|pl|cz|fr|nl|ch|at|be|se|no|fi|es|pt|br|in|jp|kr|sg|hk|au|nz))/i;
+    const domain = text.match(DOMAIN_RE);
+    if (domain) return domain[1];
+
+    // 3. Longest human-readable run (e.g. "Mined on HashedMax"); '|' separates
+    //    tag segments in some coinbases. Trailing extranonce bytes decode as
+    //    hex/digit tokens or single characters — trim those. Bare "solo" is a
+    //    ckpool marker, not a pool name — returning Unknown lets callers group
+    //    by payout address.
+    const runs = text.match(/[\x20-\x7E]{4,}/g) || [];
+    runs.sort((a, b) => b.length - a.length);
+    if (runs[0]) {
+      const segments = runs[0].split('|').filter((s) => /[A-Za-z]/.test(s));
+      segments.sort((a, b) => b.length - a.length);
+      let cleaned = (segments[0] || '').replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '').trim();
+      const innerDomain = cleaned.match(DOMAIN_RE);
+      if (innerDomain) return innerDomain[1];
+      const tokens = cleaned.split(/\s+/);
+      while (tokens.length > 1 && (/^[0-9a-f]{6,}$/i.test(tokens[tokens.length - 1]) || tokens[tokens.length - 1].length === 1)) {
+        tokens.pop();
+      }
+      cleaned = tokens.join(' ');
+      if (cleaned.length >= 4 && /[A-Za-z]/.test(cleaned) && !/^solo$/i.test(cleaned)) return cleaned;
+    }
+
     return 'Unknown';
   } catch (error) {
     return 'Unknown';
@@ -1242,6 +1311,8 @@ module.exports = {
   sendMainnetPreRpcRequest,
   getTransactionData,
   getAlgoName,
+  classifyBlockVersion,
+  extractPoolIdentifier,
   getBlocksByTimeRange,
   preloadEssentialData,
   getCacheStats,
