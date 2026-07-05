@@ -323,6 +323,11 @@ function initializeDatabase() {
     ip TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+  // Index the timestamp: /api/visitstats does `WHERE timestamp > datetime('now','-30 days')`.
+  // Without this index that is a full scan of the whole visits table (millions of rows),
+  // and because every DB call shares this single sqlite connection, a burst of visit-stats
+  // queries at startup starves the one-shot Phase 3 peer-persist and hangs the boot.
+  db.run('CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)');
 
   // Unique visitor tracking
   db.run(`CREATE TABLE IF NOT EXISTS unique_ips (
