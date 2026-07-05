@@ -50,6 +50,9 @@ const {
 // Load application configuration
 const config = require('./config.js');
 
+// Network crawler (version-handshake reachability probe + 24h version stats)
+const { createCrawler, initializeCrawlerTables } = require('./crawler.js');
+
 // ============================================================================
 // SERVER CONFIGURATION
 // ============================================================================
@@ -325,6 +328,10 @@ function initializeDatabase() {
   db.run(`CREATE TABLE IF NOT EXISTS unique_ips (
     ip TEXT PRIMARY KEY
   )`);
+
+  // Crawler-owned table (crawled_nodes) — separate from the peers.dat-backed
+  // `nodes` table, which is wiped on every 10-minute peer refresh
+  initializeCrawlerTables(db).catch((err) => console.error('Error initializing crawler tables:', err));
 }
 
 // ============================================================================
@@ -336,6 +343,9 @@ function initializeDatabase() {
  */
 let uniqueNodes = [];
 let testnetUniqueNodes = [];
+
+// Network crawler (bitcoin-seeder-style reachability probe; see crawler.js)
+let nodeCrawler = null;
 
 // ============================================================================
 // WEBSOCKET CONNECTION MANAGEMENT
@@ -377,9 +387,17 @@ wss.on('connection', (ws) => {
 
   // Send cached initial data
   sendInitialDataToClient(ws);
-  
+
   // Send geo-located peer data
   sendGeoDataToClient(ws);
+
+  // Send crawler-derived 24h node version breakdown
+  if (nodeCrawler && nodeCrawler.getSnapshot()) {
+    ws.send(JSON.stringify({
+      type: 'nodeVersions24h',
+      data: nodeCrawler.getSnapshot()
+    }));
+  }
 
   // Send cached mainnet oracle data immediately
   if (mainnetOracleCache) {
@@ -2485,6 +2503,42 @@ function broadcastGeoData(geoNodes) {
   });
 }
 
+/**
+ * Broadcast the crawler's rolling 24h node-version snapshot to all clients
+ *
+ * @param {object} snapshot - aggregateVersions() payload from crawler.js
+ */
+function broadcastNodeVersions(snapshot) {
+  const message = JSON.stringify({
+    type: 'nodeVersions24h',
+    data: snapshot
+  });
+
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting node versions to client:', error);
+      }
+    }
+  });
+}
+
+/**
+ * REST twin of the nodeVersions24h WebSocket message
+ *
+ * Registered before the visit-tracking middleware so frontend polling does
+ * not pollute visit analytics.
+ */
+app.get('/api/nodes/versions24h', (req, res) => {
+  const snapshot = nodeCrawler && nodeCrawler.getSnapshot();
+  if (snapshot) {
+    return res.json(snapshot);
+  }
+  res.status(503).json({ error: 'Crawler data not yet available' });
+});
+
 // ============================================================================
 // TESTNET PEER NETWORK MONITORING
 // ============================================================================
@@ -4380,6 +4434,53 @@ async function startServer() {
     */
 
     console.log('✓ Periodic maintenance scheduled');
+
+    // Phase 5.5: Network crawler — enumerates reachable nodes via version
+    // handshakes for the rolling 24h version breakdown on the Nodes page.
+    // Seeds: peers.dat parse cache, node addrman (getnodeaddresses), live peers.
+    if (process.env.DGB_CRAWLER_ENABLED !== '0') {
+      const parseHostPort = (addr) => {
+        const v6 = addr.match(/^\[(.+)\]:(\d+)$/);
+        if (v6) return { ip: v6[1], port: Number(v6[2]) };
+        const v4 = addr.match(/^([^:]+):(\d+)$/);
+        if (v4) return { ip: v4[1], port: Number(v4[2]) };
+        return { ip: addr, port: 12024 };
+      };
+      nodeCrawler = createCrawler({
+        db,
+        network: 'mainnet',
+        options: {
+          startHeight: inMemoryInitialData?.blockchainInfo?.blocks || 0,
+        },
+        seedProviders: [
+          // peers.dat pipeline output (kept as an independent discovery method)
+          async () => {
+            const peerData = peerCache.get('peerData');
+            const ips = [
+              ...(peerData?.uniqueIPv4Addresses || []),
+              ...(peerData?.uniqueIPv6Addresses || []),
+            ];
+            return ips.map((ip) => ({ ip, port: 12024 }));
+          },
+          // full addrman of the local node
+          async () => {
+            const addrs = await sendRpcRequest('getnodeaddresses', [0], true);
+            return (addrs || []).map((a) => ({ ip: a.address, port: a.port }));
+          },
+          // currently connected peers
+          async () => {
+            const peers = await sendRpcRequest('getpeerinfo', [], true);
+            return (peers || []).map((p) => parseHostPort(p.addr));
+          },
+        ],
+        onSnapshot: broadcastNodeVersions,
+        log: console.log,
+      });
+      nodeCrawler.start();
+      console.log('✓ Network crawler started (mainnet)');
+    } else {
+      console.log('- Network crawler disabled (DGB_CRAWLER_ENABLED=0)');
+    }
 
     // Final status report
     console.log('\n' + '='.repeat(60));
