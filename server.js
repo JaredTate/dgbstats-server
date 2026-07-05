@@ -4240,7 +4240,11 @@ async function startServer() {
       fetchLatestBlocks().then(() => console.log('✓ Recent blocks loaded')),
       fetchInitialData().then(() => console.log('✓ Initial blockchain data cached')),
       fetchTestnetInitialData().then(() => console.log('✓ Testnet initial data cached')),
-      fetchMainnetPreInitialData().then(() => console.log('✓ Mainnet-PRE initial data cached')),
+      // mainnet-PRE node decommissioned 2026-06-30 — skip its initial fetch unless re-enabled
+      // (avoids a one-time ECONNREFUSED 14046 at boot). See DGB_MAINNET_PRE_ENABLED below.
+      (process.env.DGB_MAINNET_PRE_ENABLED === 'true'
+        ? fetchMainnetPreInitialData().then(() => console.log('✓ Mainnet-PRE initial data cached'))
+        : Promise.resolve()),
       fetchTestnetLatestBlocks().then(() => console.log('✓ Testnet recent blocks loaded'))
     ]);
 
@@ -4255,6 +4259,10 @@ async function startServer() {
 
     // Phase 2.7: Start oracle/DD stats refresh (independent of peer data)
     console.log('\nPhase 2.7: Starting oracle and DigiDollar stats...');
+    // The mainnet-PRE rehearsal node was decommissioned 2026-06-30; its poll loop is
+    // disabled by default to avoid recurring ECONNREFUSED log spam against 14046.
+    // Set DGB_MAINNET_PRE_ENABLED=true (and restart the PRE node) to re-enable it.
+    const MAINNET_PRE_ENABLED = process.env.DGB_MAINNET_PRE_ENABLED === 'true';
     setInterval(() => {
       refreshAndBroadcastOracleData().catch(err =>
         console.error('Scheduled testnet oracle/DD stats refresh failed:', err));
@@ -4263,17 +4271,21 @@ async function startServer() {
       refreshAndBroadcastMainnetOracleData().catch(err =>
         console.error('Scheduled mainnet oracle/DD stats refresh failed:', err));
     }, 15000);
-    setInterval(() => {
-      refreshAndBroadcastMainnetPreOracleData().catch(err =>
-        console.error('Scheduled mainnet-pre oracle/DD stats refresh failed:', err));
-    }, 15000);
+    if (MAINNET_PRE_ENABLED) {
+      setInterval(() => {
+        refreshAndBroadcastMainnetPreOracleData().catch(err =>
+          console.error('Scheduled mainnet-pre oracle/DD stats refresh failed:', err));
+      }, 15000);
+    }
     refreshAndBroadcastOracleData().catch(err =>
       console.error('Initial testnet oracle/DD stats fetch failed:', err));
     refreshAndBroadcastMainnetOracleData().catch(err =>
       console.error('Initial mainnet oracle/DD stats fetch failed:', err));
-    refreshAndBroadcastMainnetPreOracleData().catch(err =>
-      console.error('Initial mainnet-pre oracle/DD stats fetch failed:', err));
-    console.log('✓ Oracle/DD stats intervals started for mainnet, testnet, and mainnet-pre (every 15s)');
+    if (MAINNET_PRE_ENABLED) {
+      refreshAndBroadcastMainnetPreOracleData().catch(err =>
+        console.error('Initial mainnet-pre oracle/DD stats fetch failed:', err));
+    }
+    console.log(`✓ Oracle/DD stats intervals started for mainnet, testnet${MAINNET_PRE_ENABLED ? ', and mainnet-pre' : ' (mainnet-pre disabled — node decommissioned)'} (every 15s)`);
 
     // Phase 3: Load peer network data
     console.log('\nPhase 3: Loading peer network data...');
@@ -4330,11 +4342,14 @@ async function startServer() {
         console.error('Scheduled testnet data update failed:', err));
     }, 60000);
 
-    // Modified-mainnet/PRE blockchain data updates (every 60 seconds)
-    setInterval(() => {
-      fetchMainnetPreInitialData().catch(err =>
-        console.error('Scheduled mainnet-pre data update failed:', err));
-    }, 60000);
+    // Modified-mainnet/PRE blockchain data updates (every 60 seconds) — disabled
+    // while the PRE node is decommissioned (see DGB_MAINNET_PRE_ENABLED above).
+    if (MAINNET_PRE_ENABLED) {
+      setInterval(() => {
+        fetchMainnetPreInitialData().catch(err =>
+          console.error('Scheduled mainnet-pre data update failed:', err));
+      }, 60000);
+    }
     
     // Transaction cache updates (every 30 seconds for responsiveness)
     setInterval(() => {
