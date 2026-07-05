@@ -1324,6 +1324,87 @@ registerDigiDollarRoutes('/testnet', sendTestnetRpcRequest, 'testnet');
 registerDigiDollarRoutes('/mainnet-pre', sendMainnetPreRpcRequest, 'mainnet-pre');
 
 // ============================================================================
+// PEER / ADDRESS-MANAGER DISCOVERY
+// ============================================================================
+
+/**
+ * Transform a node's address-manager RPC responses into the peer-data shape
+ * used by the network map.
+ *
+ * This replaces the legacy peers.dat binary parser, which assumed a fixed
+ * 62-byte record layout and could not read the modern addrman format-4
+ * (BIP155) file. Reading the node over RPC is immune to that whole class of
+ * format bug. Pure function — unit tested in tests/unit/peers.test.js.
+ *
+ * @param {Array|null} nodeAddresses - result of `getnodeaddresses 0`
+ *        (quality-filtered, recently-seen addresses suitable for the map)
+ * @param {object|null} addrmanInfo - result of `getaddrmaninfo`
+ *        (counts of every address the node knows, including stale ones)
+ * @returns {object} peer data: unique IPv4/IPv6 lists, totals, addrman summary
+ */
+function buildPeerData(nodeAddresses, addrmanInfo) {
+  const ipv4 = new Set();
+  const ipv6 = new Set();
+
+  const entries = Array.isArray(nodeAddresses) ? nodeAddresses : [];
+  for (const entry of entries) {
+    if (!entry || typeof entry.address !== 'string') continue;
+    if (entry.network === 'ipv4') ipv4.add(entry.address);
+    else if (entry.network === 'ipv6') ipv6.add(entry.address);
+    // onion / i2p / cjdns have no geolocation — counted via addrman only
+  }
+
+  const uniqueIPv4Addresses = [...ipv4].sort();
+  const uniqueIPv6Addresses = [...ipv6].sort();
+
+  let addrman = null;
+  if (addrmanInfo && typeof addrmanInfo === 'object') {
+    const all = addrmanInfo.all_networks || {};
+    const pick = (name) => {
+      const n = addrmanInfo[name] || {};
+      return { new: n.new || 0, tried: n.tried || 0, total: n.total || 0 };
+    };
+    addrman = {
+      total: all.total || 0,
+      new: all.new || 0,
+      tried: all.tried || 0,
+      byNetwork: {
+        ipv4: pick('ipv4'),
+        ipv6: pick('ipv6'),
+        onion: pick('onion'),
+        i2p: pick('i2p'),
+        cjdns: pick('cjdns')
+      }
+    };
+  }
+
+  return {
+    uniqueIPv4Addresses,
+    uniqueIPv6Addresses,
+    totalUniquePeers: uniqueIPv4Addresses.length + uniqueIPv6Addresses.length,
+    totalUniqueIPv4Peers: uniqueIPv4Addresses.length,
+    totalUniqueIPv6Peers: uniqueIPv6Addresses.length,
+    addrman
+  };
+}
+
+/**
+ * Fetch peer data directly from a DigiByte node over RPC.
+ *
+ * @param {Function} rpcRequest - sendRpcRequest (mainnet) or
+ *        sendTestnetRpcRequest (testnet). Either returns null on failure,
+ *        which buildPeerData degrades over gracefully.
+ * @returns {Promise<object>} peer data (see buildPeerData)
+ */
+async function fetchPeersFromNode(rpcRequest) {
+  const [nodeAddresses, addrmanInfo] = await Promise.all([
+    rpcRequest('getnodeaddresses', [0]),
+    rpcRequest('getaddrmaninfo', [])
+  ]);
+  return buildPeerData(nodeAddresses, addrmanInfo);
+}
+
+// ============================================================================
 // MODULE EXPORTS
 // ============================================================================
 
@@ -1342,5 +1423,7 @@ module.exports = {
   getCacheStats,
   resetCacheStats,
   rpcCache,
-  fetchBlocksInBatch
+  fetchBlocksInBatch,
+  buildPeerData,
+  fetchPeersFromNode
 };

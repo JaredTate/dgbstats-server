@@ -26,7 +26,6 @@ const WebSocket = require('ws');
 const geoip = require('geoip-lite');
 const NodeCache = require('node-cache');
 const sqlite3 = require('sqlite3').verbose();
-const { exec } = require('child_process');
 const path = require('path');
 const axios = require('axios');
 const fs = require('fs').promises;
@@ -44,7 +43,8 @@ const {
   classifyBlockVersion,
   extractPoolIdentifier,
   mergeRecentBlocks,
-  getBlocksByTimeRange
+  getBlocksByTimeRange,
+  fetchPeersFromNode
 } = require('./rpc');
 
 // Load application configuration
@@ -343,6 +343,8 @@ function initializeDatabase() {
  */
 let uniqueNodes = [];
 let testnetUniqueNodes = [];
+let addrmanInfo = null;
+let testnetAddrmanInfo = null;
 
 // Network crawler (bitcoin-seeder-style reachability probe; see crawler.js)
 let nodeCrawler = null;
@@ -504,7 +506,8 @@ wssTestnet.on('connection', (ws) => {
     console.log(`Sending ${testnetUniqueNodes.length} testnet geo nodes to client`);
     ws.send(JSON.stringify({
       type: 'geoData',
-      data: testnetUniqueNodes
+      data: testnetUniqueNodes,
+      addrman: testnetAddrmanInfo
     }));
   }
 
@@ -676,14 +679,16 @@ function sendInitialDataToClient(ws) {
 function sendGeoDataToClient(ws) {
   const cachedGeoNodes = peerCache.get('geoNodes');
   if (cachedGeoNodes) {
-    ws.send(JSON.stringify({ 
-      type: 'geoData', 
-      data: cachedGeoNodes 
+    ws.send(JSON.stringify({
+      type: 'geoData',
+      data: cachedGeoNodes,
+      addrman: addrmanInfo
     }));
   } else if (uniqueNodes.length > 0) {
-    ws.send(JSON.stringify({ 
-      type: 'geoData', 
-      data: uniqueNodes 
+    ws.send(JSON.stringify({
+      type: 'geoData',
+      data: uniqueNodes,
+      addrman: addrmanInfo
     }));
   }
 }
@@ -2320,7 +2325,12 @@ function broadcastInitialData(initialData) {
  * enhances them with geolocation data, and caches the results for performance.
  * The data is used for the network visualization map.
  */
-app.get('/api/getpeers', (req, res) => {
+// Guard: only one mainnet peer refresh runs at a time. Startup phase 3, the
+// periodic refresh and an API hit can all ask at once; without this, two
+// transactional DB rewrites collide on the SQLite connection and deadlock.
+let mainnetPeerRefreshPromise = null;
+
+app.get('/api/getpeers', async (req, res) => {
   // Check for cached peer data first
   const cachedPeers = peerCache.get('peerData');
   if (cachedPeers) {
@@ -2329,74 +2339,24 @@ app.get('/api/getpeers', (req, res) => {
     return res.json(cachedPeers);
   }
 
-  console.log('Cache miss - fetching fresh peer data...');
-  
-  // Execute Python script to parse peers.dat file
-  const pythonScriptPath = path.join(__dirname, 'parse_peers_dat.py');
-  exec(`python3 ${pythonScriptPath}`, { timeout: 30000 }, (error, stdout, stderr) => {
-    if (error) {
-      console.error(`Python script execution error: ${error.message}`);
-      return res.status(500).json({ error: 'Error executing peer analysis script' });
-    }
-    
-    if (stderr) {
-      console.error(`Python script stderr: ${stderr}`);
-    }
-
-    // Parse and validate script output
-    const peerData = parsePeerScriptOutput(stdout, res);
-    if (!peerData) return; // Response already sent by parser
-    
-    // Process peer data with geolocation
-    processPeerGeolocation(peerData, res);
-  });
+  try {
+    const peerData = await refreshMainnetPeerData();
+    res.json(peerData);
+  } catch (error) {
+    console.error(`Error fetching peer data from node: ${error.message}`);
+    res.status(500).json({ error: 'Error fetching peer data from node' });
+  }
 });
 
 /**
- * Parse and validate output from the Python peer analysis script
- * 
- * @param {string} stdout - Script output
- * @param {object} res - Express response object
- * @returns {object|null} Parsed peer data or null if invalid
+ * Geo-locate a peer-data address list into map-ready node records.
+ *
+ * @param {object} peerData - output of fetchPeersFromNode
+ * @returns {Array<{ip:string,country:string,city:string,lat:number,lon:number}>}
  */
-function parsePeerScriptOutput(stdout, res) {
-  try {
-    if (!stdout || stdout.trim() === '') {
-      return res.status(500).json({ error: 'Empty response from peer analysis script' });
-    }
-    
-    const output = JSON.parse(stdout);
-    
-    // Validate expected structure
-    if (!output.uniqueIPv4Addresses || !output.uniqueIPv6Addresses) {
-      return res.status(500).json({ error: 'Invalid peer data format from script' });
-    }
-
-    const ipv4Count = output.uniqueIPv4Addresses.length;
-    const ipv6Count = output.uniqueIPv6Addresses.length;
-    console.log(`Parsed peer data: ${ipv4Count} IPv4, ${ipv6Count} IPv6 addresses`);
-    
-    return output;
-    
-  } catch (parseError) {
-    console.error(`Error parsing peer script output: ${parseError.message}`);
-    console.error('Raw output:', stdout);
-    return res.status(500).json({ error: 'Error parsing peer analysis results' });
-  }
-}
-
-/**
- * Process peer IP addresses with geolocation data and update database
- * 
- * @param {object} peerData - Parsed peer data from script
- * @param {object} res - Express response object
- */
-function processPeerGeolocation(peerData, res) {
-  const { uniqueIPv4Addresses, uniqueIPv6Addresses } = peerData;
-  
-  // Combine and geo-locate all IP addresses
-  const allIPs = [...uniqueIPv4Addresses, ...uniqueIPv6Addresses];
-  const geoData = allIPs.map((ip) => {
+function geolocatePeerAddresses(peerData) {
+  const allIPs = [...peerData.uniqueIPv4Addresses, ...peerData.uniqueIPv6Addresses];
+  return allIPs.map((ip) => {
     const geoInfo = geoip.lookup(ip);
     return {
       ip,
@@ -2406,79 +2366,82 @@ function processPeerGeolocation(peerData, res) {
       lon: geoInfo?.ll?.[1] || 0
     };
   });
-  
-  console.log(`Geo-located ${geoData.length} IP addresses`);
-  
-  // Update database with new peer data
-  updatePeerDatabase(geoData, peerData, res);
 }
 
 /**
- * Update SQLite database with new peer information
- * 
- * @param {Array} geoData - Geo-located peer data
- * @param {object} peerData - Original peer data
- * @param {object} res - Express response object
+ * Rewrite the mainnet nodes table inside a single transaction.
+ * Without the transaction each of the ~7,800 rows is its own fsync, which
+ * makes the write take minutes; one transaction makes it near-instant.
+ *
+ * @param {Array} geoData - geo-located node records
+ * @returns {Promise<void>}
  */
-function updatePeerDatabase(geoData, peerData, res) {
-  db.serialize(() => {
-    // Clear existing nodes
-    db.run('DELETE FROM nodes', (deleteError) => {
-      if (deleteError) {
-        console.error('Error clearing nodes table:', deleteError);
-        return res.status(500).json({ error: 'Database error during node cleanup' });
-      }
+function persistMainnetNodes(geoData) {
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      db.run('DELETE FROM nodes');
 
-      // Insert new node data
-      const insertStatement = db.prepare(`
-        INSERT INTO nodes (ip, country, city, lat, lon)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-
+      const insertStatement = db.prepare(
+        'INSERT INTO nodes (ip, country, city, lat, lon) VALUES (?, ?, ?, ?, ?)'
+      );
       geoData.forEach((node) => {
         insertStatement.run(node.ip, node.country, node.city, node.lat, node.lon);
       });
+      insertStatement.finalize();
 
-      insertStatement.finalize((finalizeError) => {
-        if (finalizeError) {
-          console.error('Error inserting node data:', finalizeError);
-          return res.status(500).json({ error: 'Database error during node insertion' });
+      db.run('COMMIT', (commitError) => {
+        if (commitError) {
+          console.error('Error writing nodes table:', commitError);
+          db.run('ROLLBACK');
+          return reject(commitError);
         }
-
-        // Retrieve and cache updated data
-        finalizePeerDataUpdate(peerData, res);
+        resolve();
       });
     });
   });
 }
 
 /**
- * Finalize peer data update by caching results and broadcasting
- * 
- * @param {object} peerData - Original peer data
- * @param {object} res - Express response object
+ * Fetch mainnet peer data from the node, geo-locate it, persist it, cache it
+ * and broadcast it. Concurrency-guarded so simultaneous callers share one run.
+ *
+ * @returns {Promise<object>} the peer data
  */
-function finalizePeerDataUpdate(peerData, res) {
-  db.all('SELECT * FROM nodes', (selectError, rows) => {
-    if (selectError) {
-      console.error('Error retrieving updated nodes:', selectError);
-      return res.status(500).json({ error: 'Database error during node retrieval' });
+function refreshMainnetPeerData() {
+  if (mainnetPeerRefreshPromise) {
+    console.log('Mainnet peer refresh already in progress - joining it');
+    return mainnetPeerRefreshPromise;
+  }
+
+  mainnetPeerRefreshPromise = (async () => {
+    console.log('Fetching fresh peer data from node RPC...');
+    const peerData = await fetchPeersFromNode(sendRpcRequest);
+    if (!peerData.addrman) {
+      throw new Error('address-manager RPC (getaddrmaninfo) returned no data');
     }
+    console.log(
+      `Fetched peer data via RPC: ${peerData.totalUniqueIPv4Peers} IPv4, ` +
+      `${peerData.totalUniqueIPv6Peers} IPv6, addrman total ${peerData.addrman.total}`
+    );
 
-    console.log(`Updated database with ${rows.length} peer nodes`);
-    uniqueNodes = rows;
+    const geoData = geolocatePeerAddresses(peerData);
+    console.log(`Geo-located ${geoData.length} IP addresses`);
 
-    // Cache both raw peer data and geo-processed nodes
+    await persistMainnetNodes(geoData);
+    console.log(`Updated database with ${geoData.length} peer nodes`);
+
+    uniqueNodes = geoData;
+    addrmanInfo = peerData.addrman;
     peerCache.set('peerData', peerData, 600);    // 10 minutes
     peerCache.set('geoNodes', uniqueNodes, 600); // 10 minutes
-    console.log('Peer data cached for 10 minutes');
+    broadcastGeoData(uniqueNodes, addrmanInfo);
 
-    // Broadcast updated geo data to WebSocket clients
-    broadcastGeoData(uniqueNodes);
+    return peerData;
+  })();
 
-    // Send response
-    res.json(peerData);
-  });
+  mainnetPeerRefreshPromise.finally(() => { mainnetPeerRefreshPromise = null; });
+  return mainnetPeerRefreshPromise;
 }
 
 /**
@@ -2486,10 +2449,11 @@ function finalizePeerDataUpdate(peerData, res) {
  * 
  * @param {Array} geoNodes - Geo-located node data
  */
-function broadcastGeoData(geoNodes) {
-  const message = JSON.stringify({ 
-    type: 'geoData', 
-    data: geoNodes 
+function broadcastGeoData(geoNodes, addrman) {
+  const message = JSON.stringify({
+    type: 'geoData',
+    data: geoNodes,
+    addrman: addrman || null
   });
 
   wss.clients.forEach((client) => {
@@ -2549,7 +2513,10 @@ app.get('/api/nodes/versions24h', (req, res) => {
  * This endpoint parses the testnet peers.dat file to extract unique IP addresses,
  * enhances them with geolocation data, and stores them separately from mainnet.
  */
-app.get('/api/testnet/getpeers', (req, res) => {
+// Guard: only one testnet peer refresh runs at a time (see mainnet note).
+let testnetPeerRefreshPromise = null;
+
+app.get('/api/testnet/getpeers', async (req, res) => {
   // Check for cached testnet peer data first
   const cachedPeers = peerCache.get('testnetPeerData');
   if (cachedPeers) {
@@ -2558,89 +2525,63 @@ app.get('/api/testnet/getpeers', (req, res) => {
     return res.json(cachedPeers);
   }
 
-  console.log('Testnet: Cache miss - fetching fresh peer data...');
-
-  // Execute Python script to parse testnet peers.dat file
-  const pythonScriptPath = path.join(__dirname, 'parse_testnet_peers.py');
-  exec(`python3 ${pythonScriptPath}`, { timeout: 30000 }, (error, stdout, stderr) => {
-    if (error) {
-      console.error(`Testnet: Python script execution error: ${error.message}`);
-      return res.status(500).json({ error: 'Error executing testnet peer analysis script' });
-    }
-
-    if (stderr) {
-      console.error(`Testnet: Python script stderr: ${stderr}`);
-    }
-
-    // Parse and validate script output
-    try {
-      if (!stdout || stdout.trim() === '') {
-        return res.status(500).json({ error: 'Empty response from testnet peer analysis script' });
-      }
-
-      const peerData = JSON.parse(stdout);
-
-      if (!peerData.uniqueIPv4Addresses || !peerData.uniqueIPv6Addresses) {
-        return res.status(500).json({ error: 'Invalid testnet peer data format' });
-      }
-
-      const ipv4Count = peerData.uniqueIPv4Addresses.length;
-      const ipv6Count = peerData.uniqueIPv6Addresses.length;
-      console.log(`Testnet: Parsed peer data: ${ipv4Count} IPv4, ${ipv6Count} IPv6 addresses`);
-
-      // Process peer data with geolocation
-      processTestnetPeerGeolocation(peerData, res);
-
-    } catch (parseError) {
-      console.error(`Testnet: Error parsing peer script output: ${parseError.message}`);
-      return res.status(500).json({ error: 'Error parsing testnet peer analysis results' });
-    }
-  });
+  try {
+    const peerData = await refreshTestnetPeerDataFromNode();
+    res.json(peerData);
+  } catch (error) {
+    console.error(`Testnet: Error fetching peer data from node: ${error.message}`);
+    res.status(500).json({ error: 'Error fetching testnet peer data from node' });
+  }
 });
 
 /**
- * Process testnet peer IP addresses with geolocation data
+ * Fetch testnet peer data from the node, geo-locate it, cache it and
+ * broadcast it. Testnet nodes are kept in memory only (no SQLite table).
+ * Concurrency-guarded like the mainnet refresh.
+ *
+ * @returns {Promise<object>} the peer data
  */
-function processTestnetPeerGeolocation(peerData, res) {
-  const { uniqueIPv4Addresses, uniqueIPv6Addresses } = peerData;
+function refreshTestnetPeerDataFromNode() {
+  if (testnetPeerRefreshPromise) {
+    console.log('Testnet: peer refresh already in progress - joining it');
+    return testnetPeerRefreshPromise;
+  }
 
-  // Combine and geo-locate all IP addresses
-  const allIPs = [...uniqueIPv4Addresses, ...uniqueIPv6Addresses];
-  const geoData = allIPs.map((ip) => {
-    const geoInfo = geoip.lookup(ip);
-    return {
-      ip,
-      country: geoInfo?.country || 'Unknown',
-      city: geoInfo?.city || 'Unknown',
-      lat: geoInfo?.ll?.[0] || 0,
-      lon: geoInfo?.ll?.[1] || 0
-    };
-  });
+  testnetPeerRefreshPromise = (async () => {
+    console.log('Testnet: Fetching fresh peer data from node RPC...');
+    const peerData = await fetchPeersFromNode(sendTestnetRpcRequest);
+    if (!peerData.addrman) {
+      throw new Error('address-manager RPC (getaddrmaninfo) returned no data');
+    }
+    console.log(
+      `Testnet: Fetched peer data via RPC: ${peerData.totalUniqueIPv4Peers} IPv4, ` +
+      `${peerData.totalUniqueIPv6Peers} IPv6, addrman total ${peerData.addrman.total}`
+    );
 
-  console.log(`Testnet: Geo-located ${geoData.length} IP addresses`);
+    const geoData = geolocatePeerAddresses(peerData);
+    console.log(`Testnet: Geo-located ${geoData.length} IP addresses`);
 
-  // Update testnet nodes (in memory, not database)
-  testnetUniqueNodes = geoData;
+    testnetUniqueNodes = geoData;
+    testnetAddrmanInfo = peerData.addrman;
+    peerCache.set('testnetPeerData', peerData, 600);    // 10 minutes
+    peerCache.set('testnetGeoNodes', testnetUniqueNodes, 600);
+    broadcastTestnetGeoData(testnetUniqueNodes, testnetAddrmanInfo);
 
-  // Cache testnet peer data
-  peerCache.set('testnetPeerData', peerData, 600);    // 10 minutes
-  peerCache.set('testnetGeoNodes', testnetUniqueNodes, 600);
-  console.log('Testnet: Peer data cached for 10 minutes');
+    return peerData;
+  })();
 
-  // Broadcast to testnet WebSocket clients
-  broadcastTestnetGeoData(testnetUniqueNodes);
-
-  // Send response
-  res.json(peerData);
+  testnetPeerRefreshPromise.finally(() => { testnetPeerRefreshPromise = null; });
+  return testnetPeerRefreshPromise;
 }
 
 /**
  * Broadcast geo-located peer data to all testnet WebSocket clients
  */
-function broadcastTestnetGeoData(geoNodes) {
+function broadcastTestnetGeoData(geoNodes, addrman) {
   const message = JSON.stringify({
     type: 'geoData',
-    data: geoNodes
+    data: geoNodes,
+    addrman: addrman || null
   });
 
   wssTestnet.clients.forEach((client) => {

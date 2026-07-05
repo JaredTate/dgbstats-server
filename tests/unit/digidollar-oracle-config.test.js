@@ -1,7 +1,5 @@
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
 
 describe('DigiDollar Oracle/Testnet Configuration', () => {
   const projectRoot = path.resolve(__dirname, '..', '..');
@@ -34,7 +32,6 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
       'rpc.js',
       'config.js',
       'config.template.js',
-      'parse_testnet_peers.py',
       'README.md',
       'ARCHITECTURE.md',
       'REPO_MAP.md'
@@ -69,7 +66,6 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     const serverContents = readProjectFile('server.js');
     const rpcContents = readProjectFile('rpc.js');
     const templateContents = readProjectFile('config.template.js');
-    const testnetPeerParserContents = readProjectFile('parse_testnet_peers.py');
     const docsContents = [
       readProjectFile('README.md'),
       readProjectFile('ARCHITECTURE.md')
@@ -78,33 +74,28 @@ describe('DigiDollar Oracle/Testnet Configuration', () => {
     expect(serverContents).toContain("http://127.0.0.1:14026");
     expect(rpcContents).toContain("http://127.0.0.1:14026");
     expect(templateContents).toContain("testnet26/peers.dat");
-    expect(testnetPeerParserContents).toContain("testnetPeersDataPath");
-    expect(testnetPeerParserContents).toContain("'testnet26', 'peers.dat'");
     expect(docsContents).toContain("14026");
     expect(docsContents).not.toContain("14022");
   });
 
-  test('peer parsers return empty results for empty peers.dat files', () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dgbstats-peers-'));
-    const emptyPeersPath = path.join(tempDir, 'peers.dat');
-    fs.writeFileSync(emptyPeersPath, Buffer.alloc(0));
+  test('peer discovery uses node RPC, not the removed peers.dat parsers', () => {
+    const serverContents = readProjectFile('server.js');
+    const rpcContents = readProjectFile('rpc.js');
 
-    try {
-      const mainnetOutput = execFileSync('python3', ['parse_peers_dat.py'], {
-        cwd: projectRoot,
-        env: { ...process.env, PEERS_DAT_PATH: emptyPeersPath },
-        encoding: 'utf8'
-      });
-      const testnetOutput = execFileSync('python3', ['parse_testnet_peers.py'], {
-        cwd: projectRoot,
-        env: { ...process.env, TESTNET_PEERS_DAT_PATH: emptyPeersPath },
-        encoding: 'utf8'
-      });
+    // The legacy Python peers.dat parsers have been removed: they assumed a
+    // fixed 62-byte record layout and could not read the modern addrman
+    // format-4 (BIP155) file (mainnet failed closed, testnet returned garbage).
+    expect(fs.existsSync(path.join(projectRoot, 'parse_peers_dat.py'))).toBe(false);
+    expect(fs.existsSync(path.join(projectRoot, 'parse_testnet_peers.py'))).toBe(false);
 
-      expect(JSON.parse(mainnetOutput).totalUniquePeers).toBe(0);
-      expect(JSON.parse(testnetOutput).totalUniquePeers).toBe(0);
-    } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
+    // The server no longer shells out to a Python interpreter for peer data.
+    expect(serverContents).not.toContain('python3');
+    expect(serverContents).not.toContain("require('child_process')");
+
+    // Peer data is now read from the node's address manager over RPC.
+    expect(rpcContents).toContain("'getnodeaddresses'");
+    expect(rpcContents).toContain("'getaddrmaninfo'");
+    expect(serverContents).toContain('fetchPeersFromNode(sendRpcRequest)');
+    expect(serverContents).toContain('fetchPeersFromNode(sendTestnetRpcRequest)');
   });
 });
