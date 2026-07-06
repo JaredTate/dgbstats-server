@@ -118,6 +118,10 @@ describe('createForkTracker poll round', () => {
     expect(Array.isArray(snap.dailyOrphans)).toBe(true);
     expect(snap.dailyOrphans.length).toBeGreaterThanOrEqual(1);
     expect(typeof snap.avgPerDay).toBe('number');
+    // Averaged over days actually tracked (1 day here), NOT the full window —
+    // otherwise a fresh tracker reads misleadingly low.
+    expect(snap.trackedDays).toBe(1);
+    expect(snap.avgPerDay).toBe(1); // 1 orphan / 1 tracked day
   });
 
   it('fires a forkAlert only when the risk level changes', async () => {

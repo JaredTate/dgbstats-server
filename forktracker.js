@@ -311,7 +311,16 @@ function createForkTracker({
       const dailyRows = await getDailyOrphanStats(db, network, ts - opts.dailyWindowDays * 24 * 3600 * 1000).catch(() => []);
       const dailyOrphans = dailyRows.map((r) => ({ day: r.day, count: r.count, maxBranchlen: r.max_branchlen }));
       const dailyTotal = dailyOrphans.reduce((sum, d) => sum + d.count, 0);
-      const avgPerDay = Math.round((dailyTotal / opts.dailyWindowDays) * 100) / 100;
+      // Average over the days we have actually been tracking (first recorded
+      // day -> today, capped at the window) so a freshly-deployed tracker
+      // doesn't dilute today's real count across an empty 30-day window.
+      let trackedDays = 0;
+      if (dailyOrphans.length > 0) {
+        const firstMs = Date.parse(`${dailyOrphans[0].day}T00:00:00Z`);
+        const todayMs = ts - (ts % (24 * 3600 * 1000));
+        trackedDays = Math.min(opts.dailyWindowDays, Math.floor((todayMs - firstMs) / (24 * 3600 * 1000)) + 1);
+      }
+      const avgPerDay = trackedDays > 0 ? Math.round((dailyTotal / trackedDays) * 100) / 100 : 0;
       const snapshot = {
         network,
         updatedAt: ts,
@@ -327,6 +336,7 @@ function createForkTracker({
         })),
         dailyOrphans,
         avgPerDay,
+        trackedDays,
         riskLevel: effectiveLevel,
       };
 
