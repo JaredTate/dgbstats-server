@@ -227,6 +227,20 @@ describe('passive peer observation (monitor our own node connections)', () => {
     expect(after.user_agent).toBe('/DigiByte:9.26.4/');
   });
 
+  it('recordLivePeersNow captures live peers on demand and re-snapshots (fast passive cadence)', async () => {
+    let last = null;
+    const crawler = createCrawler({
+      db, network: 'mainnet', seedProviders: [],
+      livePeerProviders: [async () => [{ addr: '13.13.13.13:41000', subver: '/DigiByte:9.26.4/', inbound: true }]],
+      onSnapshot: (s) => { last = s; },
+    });
+    const snap = await crawler.recordLivePeersNow();
+    expect(snap.totalUniqueNodes).toBe(1);
+    expect(last.totalUniqueNodes).toBe(1);
+    const rows = await getNodesSeenSince(db, 'mainnet', 0);
+    expect(rows.map(r => r.ip)).toContain('13.13.13.13');
+  });
+
   it('folds live peer sightings into a crawl snapshot (passive monitoring)', async () => {
     const crawler = createCrawler({
       db, network: 'mainnet',

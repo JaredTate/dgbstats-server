@@ -670,6 +670,7 @@ function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = 
     windowHours: 24,
     targetSeries: process.env.DGB_CRAWLER_TARGET_SERIES || '9.26', // DigiDollar release line
     intervalMs: 60 * 1000,
+    livePeerIntervalMs: Number(process.env.DGB_CRAWLER_LIVEPEER_INTERVAL_MS) || 15 * 1000,
     allowUnroutable: false,
     startHeight: 0,
     ...options,
@@ -677,7 +678,9 @@ function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = 
   const frontier = new Map(); // "ip:port" -> {ip, port} not yet probed this lifetime
   let running = false;
   let crawling = false;
+  let recordingLive = false;
   let timer = null;
+  let liveTimer = null;
   let lastSnapshot = null;
 
   const enqueue = (ip, port) => {
@@ -782,12 +785,32 @@ function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = 
       }
       await recordLivePeers(Date.now());
       await evictStaleNodes(db, network, Date.now());
-      const rows = await getNodesSeenSince(db, network, Date.now() - opts.windowHours * 3600 * 1000);
-      lastSnapshot = aggregateVersions(rows, { now: Date.now(), windowHours: opts.windowHours, targetSeries: opts.targetSeries });
-      if (onSnapshot) onSnapshot(lastSnapshot);
-      return lastSnapshot;
+      return snapshotAndBroadcast();
     } finally {
       crawling = false;
+    }
+  }
+
+  // Re-aggregate the rolling 24h window and push the snapshot to listeners.
+  async function snapshotAndBroadcast() {
+    const rows = await getNodesSeenSince(db, network, Date.now() - opts.windowHours * 3600 * 1000);
+    lastSnapshot = aggregateVersions(rows, { now: Date.now(), windowHours: opts.windowHours, targetSeries: opts.targetSeries });
+    if (onSnapshot) onSnapshot(lastSnapshot);
+    return lastSnapshot;
+  }
+
+  // Fast passive cadence (default 15s): record every node currently connected to
+  // our own node and re-snapshot — WITHOUT the active probe round. This catches
+  // short-lived inbound connections that would slip between 60s crawl rounds, so
+  // the 24h audit identifies as many real nodes as possible.
+  async function recordLivePeersNow() {
+    if (recordingLive || !livePeerProviders.length) return lastSnapshot;
+    recordingLive = true;
+    try {
+      await recordLivePeers(Date.now());
+      return snapshotAndBroadcast();
+    } finally {
+      recordingLive = false;
     }
   }
 
@@ -799,14 +822,24 @@ function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = 
       timer = setInterval(() => {
         crawlOnce().catch((err) => log(`crawler round failed: ${err.message}`));
       }, opts.intervalMs);
+      // Fast passive layer: sample our own connections between crawl rounds so
+      // short-lived inbound peers are caught (no extra probing of other nodes).
+      if (livePeerProviders.length) {
+        liveTimer = setInterval(() => {
+          recordLivePeersNow().catch((err) => log(`live peer refresh failed: ${err.message}`));
+        }, opts.livePeerIntervalMs);
+      }
     },
     stop() {
       running = false;
       crawling = false;
       if (timer) clearInterval(timer);
+      if (liveTimer) clearInterval(liveTimer);
       timer = null;
+      liveTimer = null;
     },
     crawlOnce,
+    recordLivePeersNow,
     getSnapshot: () => lastSnapshot,
     enqueue,
   };
