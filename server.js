@@ -4434,6 +4434,12 @@ async function startServer() {
             return (peers || []).map((p) => parseHostPort(p.addr));
           },
         ],
+        // Passive monitoring: fold every node connected to OUR node (getpeerinfo,
+        // ~600 peers, mostly NAT'd inbound the crawler can't probe) into the rolling
+        // 24h version audit. Read-only — no extra network probing.
+        livePeerProviders: [
+          async () => (await sendRpcRequest('getpeerinfo', [], true)) || [],
+        ],
         onSnapshot: broadcastNodeVersions,
         log: console.log,
       });

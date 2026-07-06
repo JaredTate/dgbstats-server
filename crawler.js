@@ -567,6 +567,72 @@ async function recordProbeResult(db, { network, ip, port, now, result, geo = nul
   }
 }
 
+// Parse "ip:port" / "[ipv6]:port" -> { ip, port }.
+function parseHostPort(addr, defaultPort) {
+  if (!addr) return { ip: null, port: defaultPort };
+  const v6 = addr.match(/^\[(.+)\]:(\d+)$/);
+  if (v6) return { ip: v6[1], port: Number(v6[2]) };
+  const i = addr.lastIndexOf(':');
+  if (i === -1) return { ip: addr, port: defaultPort };
+  return { ip: addr.slice(0, i), port: Number(addr.slice(i + 1)) };
+}
+
+/**
+ * Normalize a `getpeerinfo` entry into a version-bearing sighting.
+ *
+ * Inbound connections reach us from an EPHEMERAL source port (e.g. :43334), not
+ * the peer's listening port, so keying on `addr` would count one node many times
+ * as it reconnects. Canonicalize inbound peers to the network's listening port so
+ * each node dedupes to one row and merges with any active-crawl row for the same IP.
+ */
+function normalizeLivePeer(peer, network = 'mainnet') {
+  const listeningPort = NETWORKS[network].port;
+  const { ip, port } = parseHostPort(peer.addr, listeningPort);
+  if (!ip) return null;
+  return {
+    ip,
+    port: peer.inbound ? listeningPort : (port || listeningPort),
+    userAgent: peer.subver || null,
+    protocolVersion: peer.version || null,
+    services: peer.services != null ? peer.services : null,
+    startHeight: peer.startingheight != null ? peer.startingheight : null,
+  };
+}
+
+/**
+ * Passive sighting: record that we observed a node (e.g. it is connected to our
+ * own node) WITHOUT disturbing the active-probe scheduler. This lets the rolling
+ * 24h audit count NAT'd peers that connect to us but never accept inbound probes.
+ * On first insert we set next_attempt 24h out so passively-seen nodes don't
+ * trigger a flood of active probes; on conflict we leave scheduling untouched.
+ */
+async function recordPeerSighting(db, { network, ip, port, now, userAgent = null, protocolVersion = null, services = null, startHeight = null, geo = null }) {
+  await run(
+    db,
+    `INSERT INTO crawled_nodes (network, ip, port, user_agent, protocol_version, services, start_height,
+       first_seen, last_seen, last_attempt, last_getaddr, fail_count, next_attempt, country, city, lat, lon)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?)
+     ON CONFLICT(network, ip, port) DO UPDATE SET
+       user_agent = COALESCE(excluded.user_agent, crawled_nodes.user_agent),
+       protocol_version = COALESCE(excluded.protocol_version, crawled_nodes.protocol_version),
+       services = COALESCE(excluded.services, crawled_nodes.services),
+       start_height = COALESCE(excluded.start_height, crawled_nodes.start_height),
+       last_seen = excluded.last_seen,
+       country = COALESCE(excluded.country, crawled_nodes.country),
+       city = COALESCE(excluded.city, crawled_nodes.city),
+       lat = COALESCE(excluded.lat, crawled_nodes.lat),
+       lon = COALESCE(excluded.lon, crawled_nodes.lon)`,
+    [
+      network, ip, port,
+      userAgent, protocolVersion,
+      services != null ? String(services) : null,
+      startHeight,
+      now, now, now + REVISIT_INTERVAL_MS,
+      geo?.country ?? null, geo?.city ?? null, geo?.lat ?? null, geo?.lon ?? null,
+    ]
+  );
+}
+
 function getNodesSeenSince(db, network, sinceMs) {
   return all(db, 'SELECT * FROM crawled_nodes WHERE network = ? AND last_seen >= ? ORDER BY last_seen DESC', [network, sinceMs]);
 }
@@ -595,7 +661,7 @@ async function evictStaleNodes(db, network, now) {
 // Crawler lifecycle
 // ---------------------------------------------------------------------------
 
-function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = [], onSnapshot = null, log = () => {} }) {
+function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = [], livePeerProviders = [], onSnapshot = null, log = () => {} }) {
   const opts = {
     concurrency: Number(process.env.DGB_CRAWLER_CONCURRENCY) || 48,
     connectTimeoutMs: 5000,
@@ -630,6 +696,29 @@ function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = 
         log(`crawler seed provider failed: ${err.message}`);
       }
     }
+  }
+
+  // Passive observation: record the version of every node currently connected to
+  // our own node (getpeerinfo). No probing — just reading our connection list —
+  // so the 24h audit also counts NAT'd peers the active crawler can never reach.
+  async function recordLivePeers(now) {
+    let recorded = 0;
+    for (const provider of livePeerProviders) {
+      try {
+        const peers = await provider();
+        for (const raw of peers || []) {
+          const p = normalizeLivePeer(raw, network);
+          if (!p || !p.userAgent || !isRoutable(p.ip)) continue;
+          const info = geoip.lookup(p.ip);
+          const geo = info ? { country: info.country || null, city: info.city || null, lat: info.ll?.[0] ?? null, lon: info.ll?.[1] ?? null } : null;
+          await recordPeerSighting(db, { network, now, ...p, geo });
+          recorded += 1;
+        }
+      } catch (err) {
+        log(`crawler live-peer provider failed: ${err.message}`);
+      }
+    }
+    if (recorded) log(`crawler(${network}): recorded ${recorded} live peer sightings (passive)`);
   }
 
   async function probeBatch(targets, now) {
@@ -691,6 +780,7 @@ function createCrawler({ db, network = 'mainnet', options = {}, seedProviders = 
         log(`crawler(${network}): probing ${targets.length} nodes (${due.length} revisits, ${fromFrontier.length} new)`);
         await probeBatch(targets, now);
       }
+      await recordLivePeers(Date.now());
       await evictStaleNodes(db, network, Date.now());
       const rows = await getNodesSeenSince(db, network, Date.now() - opts.windowHours * 3600 * 1000);
       lastSnapshot = aggregateVersions(rows, { now: Date.now(), windowHours: opts.windowHours, targetSeries: opts.targetSeries });
@@ -743,6 +833,8 @@ module.exports = {
   probeNode,
   initializeCrawlerTables,
   recordProbeResult,
+  recordPeerSighting,
+  normalizeLivePeer,
   getNodesSeenSince,
   getDueNodes,
   evictStaleNodes,

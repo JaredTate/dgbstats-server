@@ -16,6 +16,9 @@ import {
   probeNode,
   initializeCrawlerTables,
   recordProbeResult,
+  recordPeerSighting,
+  normalizeLivePeer,
+  aggregateVersions,
   getNodesSeenSince,
   getDueNodes,
   evictStaleNodes,
@@ -171,6 +174,72 @@ describe('crawler persistence', () => {
     // 6.6.6.6 last seen 30h ago -> not stale yet (7d); simulate 8 days
     const evicted = await evictStaleNodes(db, 'mainnet', NOW + 8 * 24 * 3600 * 1000);
     expect(evicted).toBe(2);
+  });
+});
+
+describe('passive peer observation (monitor our own node connections)', () => {
+  let db;
+  const NOW = 1751700000000;
+  const DAY = 24 * 3600 * 1000;
+  beforeEach(async () => {
+    db = new sqlite3.Database(':memory:');
+    await initializeCrawlerTables(db);
+  });
+  afterEach(() => new Promise((r) => db.close(r)));
+
+  it('normalizes an inbound peer ephemeral source port to the listening port', () => {
+    const n = normalizeLivePeer({ addr: '1.2.3.4:43334', subver: '/DigiByte:9.26.4/', version: 70019, inbound: true }, 'mainnet');
+    expect(n).toMatchObject({ ip: '1.2.3.4', port: 12024, userAgent: '/DigiByte:9.26.4/', protocolVersion: 70019 });
+  });
+
+  it('keeps an outbound peer real listening port and parses ipv6', () => {
+    expect(normalizeLivePeer({ addr: '5.6.7.8:12024', subver: '/DigiByte:8.26.2/', inbound: false }, 'mainnet')).toMatchObject({ ip: '5.6.7.8', port: 12024 });
+    expect(normalizeLivePeer({ addr: '9.9.9.9:8333', subver: '/x/', inbound: false }, 'mainnet')).toMatchObject({ ip: '9.9.9.9', port: 8333 });
+    expect(normalizeLivePeer({ addr: '[2001:db8::1]:55555', subver: '/x/', inbound: true }, 'mainnet')).toMatchObject({ ip: '2001:db8::1', port: 12024 });
+  });
+
+  it('records passive sightings that feed the 24h version breakdown', async () => {
+    await recordPeerSighting(db, { network: 'mainnet', ip: '1.2.3.4', port: 12024, now: NOW, userAgent: '/DigiByte:9.26.4/' });
+    await recordPeerSighting(db, { network: 'mainnet', ip: '2.2.2.2', port: 12024, now: NOW, userAgent: '/DigiByte:8.26.2/' });
+    const rows = await getNodesSeenSince(db, 'mainnet', NOW - DAY);
+    expect(rows).toHaveLength(2);
+    const agg = aggregateVersions(rows, { now: NOW, windowHours: 24, targetSeries: '9.26' });
+    expect(agg.totalUniqueNodes).toBe(2);
+  });
+
+  it('dedupes a reconnecting inbound node (same ip, canonical port) to one node', async () => {
+    const a = normalizeLivePeer({ addr: '7.7.7.7:40001', subver: '/DigiByte:9.26.4/', inbound: true }, 'mainnet');
+    const b = normalizeLivePeer({ addr: '7.7.7.7:55002', subver: '/DigiByte:9.26.4/', inbound: true }, 'mainnet');
+    await recordPeerSighting(db, { network: 'mainnet', now: NOW, ...a });
+    await recordPeerSighting(db, { network: 'mainnet', now: NOW + 1000, ...b });
+    const rows = await getNodesSeenSince(db, 'mainnet', NOW - DAY);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].last_seen).toBe(NOW + 1000);
+  });
+
+  it('does not disturb an existing active node probe schedule', async () => {
+    await recordProbeResult(db, { network: 'mainnet', ip: '8.8.8.8', port: 12024, now: NOW, result: { success: true, userAgent: '/DigiByte:9.26.3/' } });
+    const before = (await dbAll(db, "SELECT next_attempt FROM crawled_nodes WHERE ip = '8.8.8.8'"))[0].next_attempt;
+    await recordPeerSighting(db, { network: 'mainnet', ip: '8.8.8.8', port: 12024, now: NOW + 5000, userAgent: '/DigiByte:9.26.4/' });
+    const after = (await dbAll(db, "SELECT next_attempt, last_seen, user_agent FROM crawled_nodes WHERE ip = '8.8.8.8'"))[0];
+    expect(after.next_attempt).toBe(before);   // active schedule untouched
+    expect(after.last_seen).toBe(NOW + 5000);  // sighting refreshed
+    expect(after.user_agent).toBe('/DigiByte:9.26.4/');
+  });
+
+  it('folds live peer sightings into a crawl snapshot (passive monitoring)', async () => {
+    const crawler = createCrawler({
+      db, network: 'mainnet',
+      options: { concurrency: 1, allowUnroutable: true },
+      seedProviders: [],
+      livePeerProviders: [async () => [
+        { addr: '11.11.11.11:40000', subver: '/DigiByte:9.26.4/', inbound: true, version: 70019 },
+        { addr: '12.12.12.12:12024', subver: '/DigiByte:8.26.2/', inbound: false, version: 70017 },
+      ]],
+    });
+    const snap = await crawler.crawlOnce();
+    expect(snap.totalUniqueNodes).toBe(2);
+    expect(snap.versions.map(v => v.userAgent)).toContain('/DigiByte:9.26.4/');
   });
 });
 
