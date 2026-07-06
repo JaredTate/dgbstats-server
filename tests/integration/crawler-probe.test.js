@@ -146,13 +146,13 @@ describe('crawler persistence', () => {
     expect(row.next_attempt).toBe(NOW + 24 * 3600 * 1000);
   });
 
-  it('enforces the 1000s revisit floor after success', async () => {
+  it('schedules a 24h revisit after success (polite rolling audit, no re-handshaking every round)', async () => {
     await recordProbeResult(db, {
       network: 'mainnet', ip: '3.3.3.3', port: 12024, now: NOW,
       result: { success: true, userAgent: '/DigiByte:9.26.4/' },
     });
     const [row] = await dbAll(db, 'SELECT * FROM crawled_nodes');
-    expect(row.next_attempt).toBe(NOW + 1000 * 1000);
+    expect(row.next_attempt).toBe(NOW + 24 * 3600 * 1000);
   });
 
   it('selects due nodes and honors next_attempt', async () => {
@@ -217,7 +217,7 @@ describe('createCrawler round', () => {
       seedProviders: [async () => [{ ip: '127.0.0.1', port: fake.port }]], // re-advertises each round
     });
     await crawler.crawlOnce();
-    await crawler.crawlOnce(); // node has next_attempt = now + 1000s -> must be skipped
+    await crawler.crawlOnce(); // node has next_attempt = now + 24h -> must be skipped
     expect(fake.stats.connections).toBe(1);
   });
 });

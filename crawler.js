@@ -28,7 +28,7 @@ const NETWORKS = {
 };
 
 const MAX_MESSAGE_SIZE = 0x02000000; // seeder MAX_SIZE guard
-const REVISIT_FLOOR_MS = 1000 * 1000; // >= 1000s between probes of one node
+const REVISIT_INTERVAL_MS = 24 * 3600 * 1000; // re-audit an already-seen node at most once per 24h (rolling window; stay a polite crawler and never re-handshake peers every round)
 const GETADDR_INTERVAL_MS = 24 * 3600 * 1000;
 const FAILURE_BACKOFF_MS = [2 * 3600 * 1000, 8 * 3600 * 1000, 24 * 3600 * 1000];
 const EVICT_AFTER_MS = 7 * 24 * 3600 * 1000;
@@ -545,7 +545,7 @@ async function recordProbeResult(db, { network, ip, port, now, result, geo = nul
         result.startHeight || null,
         now, now, now,
         didGetAddr ? now : null,
-        now + REVISIT_FLOOR_MS,
+        now + REVISIT_INTERVAL_MS,
         geo?.country || null, geo?.city || null, geo?.lat ?? null, geo?.lon ?? null,
       ]
     );
