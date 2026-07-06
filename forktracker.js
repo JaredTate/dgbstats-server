@@ -204,6 +204,25 @@ function getRecentOrphans(db, network, sinceMs) {
   );
 }
 
+/**
+ * Per-day orphan counts (UTC), derived from orphan_blocks so it is idempotent
+ * (distinct by hash) and survives server restarts — this is the long-term
+ * "orphans per day" history that feeds the daily-averages chart.
+ */
+function getDailyOrphanStats(db, network, sinceMs) {
+  return all(
+    db,
+    `SELECT date(first_seen / 1000, 'unixepoch') AS day,
+            COUNT(*) AS count,
+            MAX(branchlen) AS max_branchlen
+     FROM orphan_blocks
+     WHERE network = ? AND first_seen >= ?
+     GROUP BY day
+     ORDER BY day ASC`,
+    [network, sinceMs]
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
@@ -223,6 +242,7 @@ function createForkTracker({
     windowBlocks: 240, // match the recentBlocks spine so the fork-tree map can attach branches
     maxTips: 60,
     orphanWindowMs: 24 * 3600 * 1000,
+    dailyWindowDays: 30,
     riskHoldMs: 3 * 60 * 1000, // hold an elevated/critical level for at least 3 min (anti-flap)
     ...options,
   };
@@ -288,6 +308,10 @@ function createForkTracker({
       }
 
       const orphans = await getRecentOrphans(db, network, ts - opts.orphanWindowMs).catch(() => []);
+      const dailyRows = await getDailyOrphanStats(db, network, ts - opts.dailyWindowDays * 24 * 3600 * 1000).catch(() => []);
+      const dailyOrphans = dailyRows.map((r) => ({ day: r.day, count: r.count, maxBranchlen: r.max_branchlen }));
+      const dailyTotal = dailyOrphans.reduce((sum, d) => sum + d.count, 0);
+      const avgPerDay = Math.round((dailyTotal / opts.dailyWindowDays) * 100) / 100;
       const snapshot = {
         network,
         updatedAt: ts,
@@ -301,6 +325,8 @@ function createForkTracker({
           hash: o.hash, height: o.height, branchlen: o.branchlen,
           status: o.status, algo: o.algo, pool: o.pool, firstSeen: o.first_seen,
         })),
+        dailyOrphans,
+        avgPerDay,
         riskLevel: effectiveLevel,
       };
 
@@ -349,5 +375,6 @@ module.exports = {
   initializeForkTables,
   recordOrphan,
   getRecentOrphans,
+  getDailyOrphanStats,
   createForkTracker,
 };
