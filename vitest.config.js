@@ -24,7 +24,7 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'html', 'lcov'],
       reportsDirectory: './tests/coverage',
-      include: ['rpc.js', 'server.js', 'crawler.js'],
+      include: ['rpc.js', 'server.js', 'crawler.js', 'forktracker.js'],
       exclude: ['node_modules/**', 'tests/**'],
       thresholds: {
         lines: 90,

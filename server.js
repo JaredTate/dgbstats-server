@@ -52,6 +52,7 @@ const config = require('./config.js');
 
 // Network crawler (version-handshake reachability probe + 24h version stats)
 const { createCrawler, initializeCrawlerTables } = require('./crawler.js');
+const { createForkTracker, initializeForkTables } = require('./forktracker.js');
 
 // ============================================================================
 // SERVER CONFIGURATION
@@ -337,6 +338,7 @@ function initializeDatabase() {
   // Crawler-owned table (crawled_nodes) — separate from the peers.dat-backed
   // `nodes` table, which is wiped on every 10-minute peer refresh
   initializeCrawlerTables(db).catch((err) => console.error('Error initializing crawler tables:', err));
+  initializeForkTables(db).catch((err) => console.error('Error initializing fork tables:', err));
 }
 
 // ============================================================================
@@ -353,6 +355,10 @@ let testnetAddrmanInfo = null;
 
 // Network crawler (bitcoin-seeder-style reachability probe; see crawler.js)
 let nodeCrawler = null;
+
+// Chain-tip / orphan / fork trackers (getchaintips poll; see forktracker.js)
+let forkTracker = null;
+let testnetForkTracker = null;
 
 // ============================================================================
 // WEBSOCKET CONNECTION MANAGEMENT
@@ -404,6 +410,14 @@ wss.on('connection', (ws) => {
       type: 'nodeVersions24h',
       data: nodeCrawler.getSnapshot()
     }));
+  }
+
+  // Send cached chain-tips snapshot + current fork-risk alert
+  if (forkTracker && forkTracker.getSnapshot()) {
+    ws.send(JSON.stringify({ type: 'chainTips', data: forkTracker.getSnapshot() }));
+  }
+  if (forkTracker && forkTracker.getAlert()) {
+    ws.send(JSON.stringify({ type: 'forkAlert', data: forkTracker.getAlert() }));
   }
 
   // Send cached mainnet oracle data immediately
@@ -514,6 +528,14 @@ wssTestnet.on('connection', (ws) => {
       data: testnetUniqueNodes,
       addrman: testnetAddrmanInfo
     }));
+  }
+
+  // Send cached testnet chain-tips snapshot + fork-risk alert
+  if (testnetForkTracker && testnetForkTracker.getSnapshot()) {
+    ws.send(JSON.stringify({ type: 'chainTips', data: testnetForkTracker.getSnapshot() }));
+  }
+  if (testnetForkTracker && testnetForkTracker.getAlert()) {
+    ws.send(JSON.stringify({ type: 'forkAlert', data: testnetForkTracker.getAlert() }));
   }
 
   // Send cached oracle data immediately
@@ -2508,6 +2530,41 @@ app.get('/api/nodes/versions24h', (req, res) => {
   res.status(503).json({ error: 'Crawler data not yet available' });
 });
 
+/**
+ * Broadcast the chain-tips snapshot / fork-risk alert to WebSocket clients.
+ * Fork alerts fire only on risk-level transitions (debounced in forktracker).
+ */
+function broadcastChainTips(snapshot, target = wss) {
+  const message = JSON.stringify({ type: 'chainTips', data: snapshot });
+  target.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try { client.send(message); } catch (error) { console.error('Error broadcasting chain tips:', error); }
+    }
+  });
+}
+
+function broadcastForkAlert(alert, target = wss) {
+  const message = JSON.stringify({ type: 'forkAlert', data: alert });
+  target.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try { client.send(message); } catch (error) { console.error('Error broadcasting fork alert:', error); }
+    }
+  });
+}
+
+// REST twins (registered before the visit-tracking middleware — see above)
+app.get('/api/chaintips', (req, res) => {
+  const snapshot = forkTracker && forkTracker.getSnapshot();
+  if (snapshot) return res.json(snapshot);
+  res.status(503).json({ error: 'Chain-tips data not yet available' });
+});
+
+app.get('/api/testnet/chaintips', (req, res) => {
+  const snapshot = testnetForkTracker && testnetForkTracker.getSnapshot();
+  if (snapshot) return res.json(snapshot);
+  res.status(503).json({ error: 'Chain-tips data not yet available' });
+});
+
 // ============================================================================
 // TESTNET PEER NETWORK MONITORING
 // ============================================================================
@@ -4447,6 +4504,37 @@ async function startServer() {
       console.log('✓ Network crawler started (mainnet)');
     } else {
       console.log('- Network crawler disabled (DGB_CRAWLER_ENABLED=0)');
+    }
+
+    // Phase 5.6: Chain-tip / orphan / fork tracker — polls getchaintips ~20s,
+    // detects reorgs/orphans, grades fork risk, and drives the site-wide banner.
+    if (process.env.DGB_FORK_TRACKER_ENABLED !== '0') {
+      forkTracker = createForkTracker({
+        db,
+        network: 'mainnet',
+        sendRpc: sendRpcRequest,
+        getRecentBlocks: () => recentBlocks,
+        onSnapshot: (snap) => broadcastChainTips(snap, wss),
+        onAlert: (alert) => broadcastForkAlert(alert, wss),
+        options: { nowFn: () => Date.now() },
+        log: console.log,
+      });
+      forkTracker.start(20000);
+      console.log('✓ Fork tracker started (mainnet)');
+
+      testnetForkTracker = createForkTracker({
+        db,
+        network: 'testnet',
+        sendRpc: sendTestnetRpcRequest,
+        getRecentBlocks: () => testnetRecentBlocks,
+        onSnapshot: (snap) => broadcastChainTips(snap, wssTestnet),
+        onAlert: (alert) => broadcastForkAlert(alert, wssTestnet),
+        options: { nowFn: () => Date.now() },
+        log: () => {}, // testnet node may be offline in some deployments; stay quiet
+      });
+      testnetForkTracker.start(30000);
+    } else {
+      console.log('- Fork tracker disabled (DGB_FORK_TRACKER_ENABLED=0)');
     }
 
     // Final status report
