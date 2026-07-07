@@ -37,9 +37,12 @@ const SECONDS_PER_HOUR = 3600;
 const POW32 = Math.pow(2, 32);
 
 // Backfill / retention windows.
-const DAILY_BACKFILL_DAYS = 90; // ~3 months of daily history on startup
+const DAILY_BACKFILL_DAYS = 1095; // ~3 years of daily history (supports 6M / 1Y / 3Y views)
 const HOURLY_BACKFILL_HOURS = 48; // ~2 days of hourly history on startup
 const HOURLY_RETENTION_DAYS = 3; // prune hourly rows older than this each tick
+// Deep daily backfill walks in chunks of this many heights so the ~6.3M-header
+// 3-year walk stays memory-bounded and can report progress / resume.
+const DEEP_CHUNK_BLOCKS = 20160; // one week per chunk
 
 // Canonical ordering for the `algos` list in the API response.
 const ALGO_ORDER = ['SHA256D', 'Scrypt', 'Skein', 'Qubit', 'Odo', 'Myriad-Groestl'];
@@ -60,6 +63,43 @@ const dbAll = (db, sql, params = []) =>
   new Promise((resolve, reject) => db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows))));
 const dbGet = (db, sql, params = []) =>
   new Promise((resolve, reject) => db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row))));
+
+// Add a column if the table doesn't already have it (SQLite has no
+// ADD COLUMN IF NOT EXISTS). table/column/decl are internal constants.
+function ensureColumn(db, table, column, decl) {
+  return dbAll(db, `PRAGMA table_info(${table})`).then((cols) => {
+    if (!cols.some((c) => c.name === column)) {
+      return dbRun(db, `ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+    }
+    return null;
+  });
+}
+
+/**
+ * Decide what the deep DAILY backfill must walk, given the current lowest
+ * backfilled height. Pure + unit-tested — this is the "don't re-walk 3 years on
+ * every restart" brain.
+ *
+ * @param {object} p
+ * @param {number} p.tip           chain tip height
+ * @param {number} p.days          configured daily depth (e.g. 1095)
+ * @param {number|null} p.currentLow  history_meta.backfill_low_height (null if none yet)
+ * @param {number} [p.blocksPerDay]
+ * @returns {null|{start:number,end:number}}
+ *   - `null`  → DB already covers `tip - days*blocksPerDay`; SKIP.
+ *   - full range `{targetStart..tip}` when nothing is backfilled yet.
+ *   - older-gap-only `{targetStart..currentLow-1}` when coverage must extend down.
+ */
+function computeBackfillGap({ tip, days, currentLow, blocksPerDay = BLOCKS_PER_DAY }) {
+  const targetStart = Math.max(0, tip - days * blocksPerDay);
+  if (currentLow === null || currentLow === undefined) {
+    return { start: targetStart, end: tip }; // nothing backfilled yet → full range
+  }
+  if (currentLow <= targetStart) {
+    return null; // already covers the target start → skip the deep walk
+  }
+  return { start: targetStart, end: currentLow - 1 }; // extend the missing older gap only
+}
 
 function initHistoryTables(db) {
   return dbRun(
@@ -83,9 +123,12 @@ function initHistoryTables(db) {
         network TEXT PRIMARY KEY,
         last_height INTEGER,
         backfill_done INTEGER DEFAULT 0,
+        backfill_low_height INTEGER,
         updated_at INTEGER
       )`
     ))
+    // Migrate history_meta created before backfill_low_height existed.
+    .then(() => ensureColumn(db, 'history_meta', 'backfill_low_height', 'INTEGER'))
     .then(() => dbRun(db, 'CREATE INDEX IF NOT EXISTS idx_daily_algo_stats_day ON daily_algo_stats(network, day)'))
     .then(() => dbRun(
       db,
@@ -391,17 +434,22 @@ function createHistoryTracker({
 
   const getMeta = () => dbGet(db, 'SELECT * FROM history_meta WHERE network = ?', [network]);
 
-  const setMeta = ({ last_height, backfill_done }) =>
+  // COALESCE-preserve: fields left undefined keep their existing value, so the
+  // deep backfill can advance backfill_low_height without touching last_height.
+  const setMeta = ({ last_height, backfill_done, backfill_low_height } = {}) =>
     dbRun(
       db,
-      `INSERT INTO history_meta (network, last_height, backfill_done, updated_at)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO history_meta (network, last_height, backfill_done, backfill_low_height, updated_at)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(network) DO UPDATE SET
-         last_height = excluded.last_height,
-         backfill_done = excluded.backfill_done,
+         last_height = COALESCE(excluded.last_height, history_meta.last_height),
+         backfill_done = COALESCE(excluded.backfill_done, history_meta.backfill_done),
+         backfill_low_height = COALESCE(excluded.backfill_low_height, history_meta.backfill_low_height),
          updated_at = excluded.updated_at`,
-      [network, last_height, backfill_done, nowFn()]
+      [network, last_height ?? null, backfill_done ?? null, backfill_low_height ?? null, nowFn()]
     );
+
+  const setBackfillLow = (low) => setMeta({ backfill_low_height: low });
 
   const setLastHeight = (h) =>
     dbRun(
@@ -446,9 +494,16 @@ function createHistoryTracker({
   }
 
   /**
-   * One-time DAILY backfill of the last `days` UTC days from headers. Folds the
-   * whole range in one pass and REPLACE-writes, so it is idempotent. RPC failures
-   * are caught and logged — the job aborts without throwing.
+   * SMART deep DAILY backfill (up to `days` ≈ 3 years). Only walks the range that
+   * is actually missing, so a restart does NOT re-walk millions of headers:
+   *   - already covers `tip - days*5760`  → skip (fast path, the common restart).
+   *   - nothing backfilled yet            → walk the full `[targetStart..tip]`.
+   *   - target grew (deeper config)       → walk only the older gap `[targetStart..currentLow-1]`.
+   * Walks DESCENDING in bounded chunks (recent days appear first, memory stays
+   * bounded), folding each chunk and ADDing it. `backfill_low_height` advances
+   * per chunk so a crash resumes from where it left off (idempotent progress).
+   * All RPC is wrapped — an offline node aborts without throwing. Non-blocking
+   * only in the sense that init() runs this on a background promise.
    */
   async function backfill() {
     try {
@@ -457,12 +512,39 @@ function createHistoryTracker({
         log(`[history:${network}] backfill skipped — no blockchain info (node offline?)`);
         return false;
       }
-      const from = Math.max(0, tip - days * BLOCKS_PER_DAY);
-      const headers = await fetchHeadersRange(from, tip);
-      const aggs = foldHeaders(headers);
-      for (const agg of aggs) await upsertReplace(db, network, agg);
-      await setMeta({ last_height: tip, backfill_done: 1 });
-      log(`[history:${network}] daily backfill complete: heights ${from}..${tip}, ${headers.length} headers -> ${aggs.length} day/algo rows`);
+      const meta = await getMeta();
+      let currentLow = meta && typeof meta.backfill_low_height === 'number' ? meta.backfill_low_height : null;
+      const gap = computeBackfillGap({ tip, days, currentLow });
+      if (!gap) {
+        log(`[history:${network}] daily backfill up-to-date (low=${currentLow}, target=${Math.max(0, tip - days * BLOCKS_PER_DAY)})`);
+        return true;
+      }
+
+      // First entry ever: establish the forward cursor + backfill_done up front so a
+      // crash mid-walk resumes as an older-gap extension (never a full re-walk).
+      if (currentLow === null) {
+        await setMeta({ last_height: tip, backfill_done: 1, backfill_low_height: tip + 1 });
+        currentLow = tip + 1;
+      }
+
+      const targetStart = gap.start;
+      const totalToWalk = currentLow - targetStart;
+      let high = currentLow - 1;
+      let walked = 0;
+      while (high >= targetStart) {
+        const low = Math.max(targetStart, high - DEEP_CHUNK_BLOCKS + 1);
+        const headers = await fetchHeadersRange(low, high);
+        const aggs = foldHeaders(headers);
+        // ADD (not REPLACE): every height here is strictly below the previous
+        // low-water mark, so each block is folded exactly once; a day split across
+        // chunks (or the seam with already-covered data) merges correctly.
+        for (const agg of aggs) await upsertAccumulate(db, network, agg);
+        await setBackfillLow(low);
+        walked += high - low + 1;
+        log(`[history:${network}] deep daily backfill: heights ${low}..${high} (${walked}/${totalToWalk})`);
+        high = low - 1;
+      }
+      log(`[history:${network}] deep daily backfill complete down to height ${targetStart}`);
       return true;
     } catch (e) {
       log(`[history:${network}] backfill error: ${e.message}`);
@@ -591,10 +673,27 @@ function createHistoryTracker({
    */
   async function run() {
     const meta = await getMeta();
-    if (!meta || !meta.backfill_done) {
-      await backfill(); // 90d daily REPLACE; sets cursor = tip, backfill_done = 1
+    const firstRun = !meta || !meta.backfill_done;
+
+    // First deploy only: seed the hourly (intraday) view quickly so it is usable
+    // BEFORE the potentially multi-hour deep 3-year daily walk finishes. Cheap
+    // (~48h of headers). On restarts the startup sync below already covers this.
+    if (firstRun) {
+      try {
+        const tip0 = await getTip();
+        if (tip0 !== null) {
+          await refreshHourlyTo(tip0, hours);
+          await pruneHourly();
+        }
+      } catch (e) {
+        log(`[history:${network}] hourly pre-seed error: ${e.message}`);
+      }
     }
-    await incrementalOnce(); // ADD any gap into daily + hourly, advance cursor
+
+    // Smart deep daily backfill: full ~3y walk on first run, skip (or extend the
+    // older gap if the target grew) on restart. Idempotent + resumable.
+    await backfill();
+    await incrementalOnce(); // ADD any forward gap into daily + hourly, advance cursor
     // Recompute both recent windows to one fresh tip, then set the cursor to it.
     try {
       const tip = await getTip();
@@ -679,8 +778,8 @@ function clampInt(value, def, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/** Clamp a ?days= query value into [1, 90], defaulting to 30. */
-function clampDays(value, def = 30, min = 1, max = 90) {
+/** Clamp a ?days= query value into [1, 1095] (up to ~3 years), defaulting to 30. */
+function clampDays(value, def = 30, min = 1, max = DAILY_BACKFILL_DAYS) {
   return clampInt(value, def, min, max);
 }
 
@@ -692,11 +791,13 @@ function clampHours(value, def = 24, min = 1, max = 48) {
 module.exports = {
   BLOCKS_PER_DAY,
   BLOCKS_PER_HOUR,
+  DEEP_CHUNK_BLOCKS,
   DAILY_BACKFILL_DAYS,
   HOURLY_BACKFILL_HOURS,
   HOURLY_RETENTION_DAYS,
   bucketDay,
   bucketHour,
+  computeBackfillGap,
   initHistoryTables,
   foldHeadersBy,
   foldHeaders,

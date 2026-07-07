@@ -292,6 +292,79 @@ describe('hourly rollup', () => {
   });
 });
 
+// Wrap makeChain's RPC to record which heights getblockheader was called for,
+// so we can prove the smart backfill walks ONLY the missing range.
+function instrumentedChain(tip) {
+  const chain = makeChain(tip);
+  const fetched = [];
+  const sendRpc = async (method, params) => {
+    if (method === 'getblockheader') fetched.push(Number(String(params[0]).slice(1)));
+    return chain.sendRpc(method, params);
+  };
+  return { chain, fetched, sendRpc };
+}
+
+describe('smart deep backfill (skip / gap-only)', () => {
+  let db;
+  beforeEach(async () => {
+    db = new sqlite3.Database(':memory:');
+    await initHistoryTables(db);
+  });
+  afterEach(() => new Promise((r) => db.close(r)));
+
+  it('first run walks the range + records backfill_low_height; a restart SKIPS (no re-walk)', async () => {
+    const { fetched, sendRpc } = instrumentedChain(19);
+    const t = createHistoryTracker({ db, network: 'mainnet', sendRpc, days: 30, nowFn });
+    await t.backfill();
+    expect(fetched.length).toBeGreaterThan(0); // it walked
+    const meta1 = await dbGet(db, 'SELECT * FROM history_meta WHERE network=?', ['mainnet']);
+    expect(meta1.backfill_low_height).toBe(0); // targetStart = max(0, 19 - 30*5760) = 0
+    expect(meta1.last_height).toBe(19);
+    expect(meta1.backfill_done).toBe(1);
+
+    fetched.length = 0;
+    const ok = await t.backfill(); // restart with same tip
+    expect(ok).toBe(true);
+    expect(fetched).toHaveLength(0); // SKIPPED — no header re-walk
+  });
+
+  it('extends ONLY the older gap when coverage is partial (does not re-touch covered heights)', async () => {
+    const { fetched, sendRpc } = instrumentedChain(19);
+    const t = createHistoryTracker({ db, network: 'mainnet', sendRpc, days: 30, nowFn });
+    // Simulate a shallow prior backfill that only reached down to height 12.
+    await new Promise((res, rej) => db.run(
+      'INSERT INTO history_meta (network, last_height, backfill_done, backfill_low_height, updated_at) VALUES (?,?,?,?,?)',
+      ['mainnet', 19, 1, 12, Date.now()], (e) => (e ? rej(e) : res())));
+
+    fetched.length = 0;
+    await t.backfill();
+
+    const walked = [...new Set(fetched)].sort((a, b) => a - b);
+    // gap = [targetStart(0) .. currentLow-1(11)] — heights 0..11 only.
+    expect(Math.min(...walked)).toBe(0);
+    expect(Math.max(...walked)).toBe(11);
+    expect(walked).not.toContain(12); // already covered — not re-walked
+    expect(walked).not.toContain(19);
+
+    const meta = await dbGet(db, 'SELECT * FROM history_meta WHERE network=?', ['mainnet']);
+    expect(meta.backfill_low_height).toBe(0); // extended down to the new target
+    expect(meta.last_height).toBe(19); // forward cursor untouched by the deep extend
+  });
+
+  it('sliding window: after a restart with a higher tip the deep walk is skipped', async () => {
+    const { sendRpc } = instrumentedChain(19);
+    const t = createHistoryTracker({ db, network: 'mainnet', sendRpc, days: 30, nowFn });
+    await t.backfill(); // low -> 0
+
+    // Chain advanced; with days=30 the (clamped-at-0) target is still 0, already covered.
+    const { fetched: fetched2, sendRpc: sendRpc2 } = instrumentedChain(25);
+    const t2 = createHistoryTracker({ db, network: 'mainnet', sendRpc: sendRpc2, days: 30, nowFn });
+    fetched2.length = 0;
+    await t2.backfill();
+    expect(fetched2).toHaveLength(0); // covered (low 0 <= target 0) — skipped
+  });
+});
+
 describe('offline node resilience', () => {
   it('aborts backfill without throwing when getblockchaininfo fails', async () => {
     const db = new sqlite3.Database(':memory:');

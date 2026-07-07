@@ -2572,9 +2572,9 @@ app.get('/api/testnet/chaintips', (req, res) => {
 });
 
 // Historical per-algo difficulty / hashrate (reconstructed from headers; see
-// history.js). Daily: ?days=30 clamped [1,90], hashrate over 86400s, final
-// (today) entry partial. Hourly: ?hours=24 clamped [1,48], hashrate over 3600s,
-// final (current hour) entry partial. Twin routes for mainnet and testnet.
+// history.js). Daily: ?days=30 clamped [1,1095] (~3y depth), hashrate over
+// 86400s, final (today) entry partial. Hourly: ?hours=24 clamped [1,48],
+// hashrate over 3600s, final (current hour) entry partial. Mainnet + testnet.
 async function handleHistoryDaily(network, req, res) {
   if (!historyTracker) {
     return res.status(503).json({ error: 'Historical data not yet available' });
@@ -4585,11 +4585,12 @@ async function startServer() {
       console.log('- Fork tracker disabled (DGB_FORK_TRACKER_ENABLED=0)');
     }
 
-    // Phase 5.7: Historical per-algo stats — reconstructs ~90-day daily and
+    // Phase 5.7: Historical per-algo stats — reconstructs ~3-year daily and
     // ~48h hourly difficulty/hashrate history from block headers (works on a
     // pruned node), persisted in history.db. ENABLED BY DEFAULT — a plain
     // `node server.js` runs it; set DGB_HISTORY_DISABLED=1 to turn it off.
-    // Non-blocking: backfill runs in the background; testnet is guarded so an
+    // Non-blocking: the deep daily backfill is smart (walks only the missing
+    // range, resumable) and runs in the background; testnet is guarded so an
     // offline testnet node stays silent/non-fatal.
     if (process.env.DGB_HISTORY_DISABLED !== '1') {
       historyTracker = history.init({
@@ -4597,7 +4598,7 @@ async function startServer() {
         sendTestnetRpc: sendTestnetRpcRequest,
         log: console.log,
       });
-      console.log('✓ Historical stats started (daily 90d + hourly 48h; mainnet + testnet backfill in background)');
+      console.log('✓ Historical stats started (daily ~3y + hourly 48h; mainnet + testnet backfill in background)');
     } else {
       console.log('- Historical stats disabled (DGB_HISTORY_DISABLED=1)');
     }

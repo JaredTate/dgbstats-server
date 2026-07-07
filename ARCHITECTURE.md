@@ -163,11 +163,11 @@ dgbstats-server/                   # Root directory
 ### 4. Historical Stats — daily + hourly (`history.js`)
 
 **Purpose**: Long-term per-algorithm difficulty and hashrate history at two
-resolutions — a ~90-day DAILY view and a ~48h HOURLY intraday view —
-reconstructed from block HEADERS so it works against a PRUNED node (pruned nodes
-retain every header). Persisted in its own `history.db` so it never contends
-with the peer/crawler/fork tables in `nodes.db`. **Enabled by default** (a plain
-`node server.js` runs it).
+resolutions — a ~3-year DAILY view (1095 days, to support 6M / 1Y / 3Y frontend
+ranges) and a ~48h HOURLY intraday view — reconstructed from block HEADERS so it
+works against a PRUNED node (pruned nodes retain every header back to genesis).
+Persisted in its own `history.db` so it never contends with the peer/crawler/fork
+tables in `nodes.db`. **Enabled by default** (a plain `node server.js` runs it).
 
 **Aggregation model**: DigiByte retargets difficulty EVERY block per algo, so a
 bucket's representative value is the AVERAGE over all of that algo's blocks in
@@ -187,18 +187,30 @@ the ONE shared implementation; `foldHeaders` (UTC day) and `foldHeadersHourly`
 
 **Background jobs** (per network, all RPC wrapped in try/catch so an offline
 node aborts its own work without throwing):
-- **Daily backfill** — one-time walk of `[tip - 90*5760 .. tip]` via
-  `getblockhash` + `getblockheader` with bounded concurrency (~12 in flight);
-  folds the range and REPLACE-writes each day row (idempotent). Sets
-  `history_meta.last_height=tip, backfill_done=1`.
+- **Smart deep daily backfill** — `computeBackfillGap({tip, days, currentLow})`
+  decides what actually needs walking against `history_meta.backfill_low_height`
+  (the lowest height backfilled so far):
+  - already covers `tip - 1095*5760` → **SKIP** (the common restart — no re-walk
+    of ~6.3M headers);
+  - nothing backfilled → walk the full `[targetStart..tip]`;
+  - depth grew → walk only the missing older gap `[targetStart..currentLow-1]`.
+  Walks DESCENDING in bounded chunks (a week each) via `getblockhash` +
+  `getblockheader` (~12 concurrent), folding + ADDing each chunk and advancing
+  `backfill_low_height` per chunk so a crash resumes where it left off. First
+  entry sets `last_height=tip, backfill_done=1` up front. Idempotent + resumable.
 - **Hourly backfill** — REPLACE-writes the last ~48h of `hourly_algo_stats` from
-  the same header source (bucketed by hour).
+  the same header source (bucketed by hour). Seeded before the deep daily walk on
+  first run so the intraday view is available quickly.
 - **Incremental updater** — every 60s, folds headers for `last_height+1 .. tip`,
   ADDS them onto the affected DAILY and HOURLY rows, advances `last_height`, and
   PRUNES hourly rows older than ~3 days so that table stays tiny.
 - **Startup sync** — after backfill/catch-up, REPLACE-recomputes both recent
   windows (last 2 days, last 48h) to a single tip snapshot and sets the cursor
   to it, so neither table is ever left with a gap or a double-counted block.
+
+The deep 3-year walk is a one-time first-deploy cost that runs on a background
+promise (the server stays fully responsive); every later restart hits the SKIP
+fast path.
 
 Wired in from `server.js` after the HTTP server is listening
 (`history.init(...)`); **on by default**, turned off with `DGB_HISTORY_DISABLED=1`.
@@ -246,7 +258,7 @@ Wired in from `server.js` after the HTTP server is listening
 | Endpoint | Method | Purpose | Data Source |
 |----------|--------|---------|-------------|
 | `/api/chaintips` | GET | Chain-tip / orphan / fork snapshot | forktracker.js |
-| `/api/history/daily` | GET | Daily per-algo difficulty/hashrate (`?days=30`, clamped 1–90) | history.js / history.db |
+| `/api/history/daily` | GET | Daily per-algo difficulty/hashrate (`?days=30`, clamped 1–1095 ≈ 3y) | history.js / history.db |
 | `/api/history/hourly` | GET | Hourly per-algo difficulty/hashrate (`?hours=24`, clamped 1–48) | history.js / history.db |
 
 ## Testnet Support
@@ -572,7 +584,7 @@ CREATE TABLE daily_algo_stats (
 ```
 Purpose: One row per network/day/algo. `avgDifficulty = sum_difficulty /
 block_count` and `hashrate = 2^32 * sum_difficulty / 86400` are derived at query
-time. Backfilled ~90 days deep.
+time. Backfilled ~3 years (1095 days) deep, progressively.
 
 #### `hourly_algo_stats` Table
 ```sql
@@ -597,13 +609,17 @@ pruned to ~3 days each incremental tick so the table stays tiny.
 ```sql
 CREATE TABLE history_meta (
   network TEXT PRIMARY KEY,
-  last_height INTEGER,         -- highest height folded in so far
+  last_height INTEGER,          -- highest height folded in (forward cursor)
   backfill_done INTEGER DEFAULT 0,
+  backfill_low_height INTEGER,  -- lowest height backfilled (deep-backfill low-water mark)
   updated_at INTEGER
 );
 ```
-Purpose: Per-network cursor + backfill flag so the incremental updater knows
-where to resume and backfill runs only once.
+Purpose: Per-network cursors + backfill flag. `last_height` is the forward
+cursor (where the 60s incremental resumes); `backfill_low_height` is how deep the
+daily history reaches, driving the smart-skip decision so a restart never
+re-walks the ~3-year range. Added by an `ALTER TABLE` migration on DBs created
+before this column existed.
 
 #### `/api/history/daily` response contract
 ```json
@@ -699,7 +715,8 @@ Phase 5: Schedule Periodic Tasks
 ├─ Mempool refresh: every 30 seconds
 ├─ Peer data refresh: every 10 minutes
 ├─ Fork tracker poll: every 20s (mainnet) / 30s (testnet)
-├─ History: daily 90d + hourly 48h backfill (once) then incremental updater
+├─ History: smart daily ~3y (walks only the missing range) + hourly 48h backfill,
+│    then incremental updater
 │    every 60s (folds daily + hourly, prunes hourly >3d); on by default
 └─ Cache persistence: every 60 seconds
 ```

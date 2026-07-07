@@ -29,18 +29,19 @@
 - Serves as environment bootstrap/reference file.
 
 ### history.js
-- Historical per-algo difficulty/hashrate stats at TWO resolutions — a ~90-day DAILY view and a ~48h HOURLY intraday view — reconstructed from block HEADERS (works on a PRUNED node). Enabled by default.
-- Owns its own SQLite file `history.db` (tables `daily_algo_stats`, `hourly_algo_stats`, `history_meta`); promisified `dbRun`/`dbAll`/`dbGet` helpers mirror crawler.js/forktracker.js.
+- Historical per-algo difficulty/hashrate stats at TWO resolutions — a ~3-year (1095-day) DAILY view (for 6M / 1Y / 3Y frontend ranges) and a ~48h HOURLY intraday view — reconstructed from block HEADERS (works on a PRUNED node back to genesis). Enabled by default.
+- Owns its own SQLite file `history.db` (tables `daily_algo_stats`, `hourly_algo_stats`, `history_meta`); promisified `dbRun`/`dbAll`/`dbGet` helpers mirror crawler.js/forktracker.js; `ensureColumn` migrates older DBs.
 - Pure functions (unit-tested):
   - `foldHeadersBy(headers, bucketOf, keyName)` — ONE shared implementation; `foldHeaders` (UTC day) and `foldHeadersHourly` (UTC hour `YYYY-MM-DDTHH:00:00Z`) are wrappers. Buckets `[{time, difficulty, algo, height}]` into per-(bucket, algo) aggregates `{block_count, sum_difficulty, min/max/last_difficulty, last_height}`.
   - `buildBucketResponse(...)` with `buildDailyResponse` / `buildHourlyResponse` wrappers — shape rows into the API contract; derive `avgDifficulty = sum/count` and `hashrate = 2^32 * sum_difficulty / secondsPerWindow` (86400 daily, 3600 hourly); flag the final (current) bucket `partial`.
-  - `bucketDay`/`bucketHour`; `sortAlgos`; `clampDays` (`?days` clamped 1–90, default 30); `clampHours` (`?hours` clamped 1–48, default 24).
-- `createHistoryTracker({db, network, sendRpc, days=90, hours=48, hourlyRetentionDays=3, ...})` — per-network jobs, all RPC wrapped in try/catch (offline node aborts its own work, never throws):
-  - `backfill()` — one-time DAILY walk of `[tip - 90*5760 .. tip]` (`getblockhash` + `getblockheader`) with bounded concurrency (~12), REPLACE-writes each day row (idempotent).
-  - `backfillHourly()` / `refreshHourlyTo(tip, hours)` — REPLACE-writes the last ~48h of `hourly_algo_stats` from the same header source.
+  - `computeBackfillGap({tip, days, currentLow})` — the smart-backfill brain: `null` (already covers `tip - days*5760` → SKIP), full `{targetStart..tip}` (nothing yet), or older-gap-only `{targetStart..currentLow-1}` (depth grew).
+  - `bucketDay`/`bucketHour`; `sortAlgos`; `clampDays` (`?days` clamped 1–1095, default 30); `clampHours` (`?hours` clamped 1–48, default 24).
+- `createHistoryTracker({db, network, sendRpc, days=1095, hours=48, hourlyRetentionDays=3, ...})` — per-network jobs, all RPC wrapped in try/catch (offline node aborts its own work, never throws):
+  - `backfill()` — SMART deep DAILY backfill. Uses `computeBackfillGap` against `history_meta.backfill_low_height` to walk ONLY the missing range: SKIP when covered (fast restart), full `[targetStart..tip]` on first run, or the older gap when depth grew. Walks DESCENDING in week-sized chunks, folds + ADDs each, advances `backfill_low_height` per chunk (resumable). First entry sets `last_height=tip, backfill_done=1` up front.
+  - `backfillHourly()` / `refreshHourlyTo(tip, hours)` — REPLACE-writes the last ~48h of `hourly_algo_stats` from the same header source (seeded before the deep daily walk on first run).
   - `incrementalOnce()` — every 60s folds `last_height+1 .. tip` and ADDS onto affected DAILY + HOURLY rows, advances `last_height`, and `pruneHourly()` (deletes hourly rows older than ~3 days).
   - `refoldRecentDays(2)` + startup sync — recompute both recent windows (last 2 days, last 48h) to a single tip snapshot so neither table is left with a gap or double-count.
-- `init({sendRpc, sendTestnetRpc, days, hours, log})` — opens `history.db`, creates tables, kicks off mainnet + testnet trackers (testnet guarded/silent), returns `{db, getDaily(network, days), getHourly(network, hours), stop()}`. Non-blocking.
+- `init({sendRpc, sendTestnetRpc, days, hours, log})` — opens `history.db`, creates tables, kicks off mainnet + testnet trackers (testnet guarded/silent), returns `{db, getDaily(network, days), getHourly(network, hours), stop()}`. Non-blocking (the ~3y first-run walk runs on a background promise; later restarts hit the SKIP fast path).
 - Wired into `server.js` after the HTTP server is listening; endpoints `GET /api/history/daily`, `GET /api/history/hourly` (+ `/api/testnet/*` twins). ENABLED BY DEFAULT — turn off with `DGB_HISTORY_DISABLED=1`.
 
 ### package.json
@@ -210,7 +211,7 @@
 
 ### tests/integration/history-db.test.js
 - Integration tests for `history.js` persistence + the backfill/incremental/refold jobs against an in-memory sqlite and a fake header-only RPC.
-- Covers daily + hourly table creation, idempotent backfill (REPLACE), additive incremental catch-up (ACCUMULATE) into both daily and hourly, full-day refold correction, `queryDaily`/`queryHourly`, hourly backfill/pruning, the full `run()` startup sequence, and offline-node resilience (no throw).
+- Covers daily + hourly table creation, idempotent backfill, additive incremental catch-up (ACCUMULATE) into both daily and hourly, full-day refold correction, `queryDaily`/`queryHourly`, hourly backfill/pruning, the full `run()` startup sequence, offline-node resilience (no throw), and the SMART deep-backfill (first-run walks + records `backfill_low_height`, restart SKIPS, partial coverage extends only the older gap — asserted by counting which heights `getblockheader` was called for).
 
 ### tests/integration/websocket.test.js
 - Integration tests dedicated to WebSocket behavior.
@@ -221,7 +222,8 @@
 - Unit tests for `history.js` pure functions (daily + hourly).
 - `foldHeaders`/`foldHeadersHourly`: UTC-day and UTC-hour bucketing across the respective boundary, per-algo sum/min/max/last/count, and `last_*` taken from the highest height; `bucketHour` zeroes minutes/seconds to a Z-suffixed ISO string.
 - `buildDailyResponse`/`buildHourlyResponse`: `avgDifficulty = sum/count`, `hashrate = 2^32 * sum_difficulty / secondsPerWindow` (86400 daily, 3600 hourly), final bucket flagged `partial`, canonical `algos`, and the full response contract (`days`/`date` vs `hours`/`hour`).
-- Helper coverage for `sortAlgos`, `clampDays`, and `clampHours`.
+- `computeBackfillGap`: no-coverage → full range, already-covered → null (skip), partial → older-gap-only, depth-increase extension, genesis clamp.
+- Helper coverage for `sortAlgos`, `clampDays` (1–1095 bound), and `clampHours`.
 
 ### tests/unit/rpc.test.js
 - Unit tests for `rpc.js` internals and behaviors.

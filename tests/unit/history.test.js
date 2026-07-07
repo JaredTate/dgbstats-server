@@ -14,6 +14,8 @@ import {
   clampDays,
   clampHours,
   bucketHour,
+  computeBackfillGap,
+  BLOCKS_PER_DAY,
 } from '../../history.js';
 
 // 2026-07-05 UTC anchors
@@ -175,7 +177,9 @@ describe('sortAlgos / clampDays helpers', () => {
     expect(clampDays('abc')).toBe(30);
     expect(clampDays('7')).toBe(7);
     expect(clampDays('0')).toBe(1);
-    expect(clampDays('1000')).toBe(90);
+    expect(clampDays('365')).toBe(365); // 1-year view now allowed
+    expect(clampDays('1095')).toBe(1095); // 3-year max
+    expect(clampDays('99999')).toBe(1095); // clamped to the 3-year bound
   });
 
   it('clamps hours into [1,48] with a default of 24', () => {
@@ -269,5 +273,46 @@ describe('buildHourlyResponse — derivation math + shape', () => {
     expect(typeof res.data[0].hour).toBe('string');
     const keys = Object.keys(res.data[0].perAlgo.SHA256D).sort();
     expect(keys).toEqual(['avgDifficulty', 'blocks', 'hashrate', 'lastDifficulty', 'maxDifficulty', 'minDifficulty']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Smart deep-backfill gap decision (the "don't re-walk 3 years every restart")
+// ---------------------------------------------------------------------------
+
+describe('computeBackfillGap', () => {
+  const TIP = 10_000_000;
+  const DAYS = 1095;
+  const target = Math.max(0, TIP - DAYS * BLOCKS_PER_DAY); // = TIP - 6,307,200
+
+  it('no coverage yet (currentLow null) => full range [targetStart..tip]', () => {
+    expect(computeBackfillGap({ tip: TIP, days: DAYS, currentLow: null })).toEqual({ start: target, end: TIP });
+    expect(computeBackfillGap({ tip: TIP, days: DAYS, currentLow: undefined })).toEqual({ start: target, end: TIP });
+  });
+
+  it('already covers the target (currentLow <= targetStart) => null (SKIP)', () => {
+    expect(computeBackfillGap({ tip: TIP, days: DAYS, currentLow: target })).toBeNull(); // exactly at target
+    expect(computeBackfillGap({ tip: TIP, days: DAYS, currentLow: target - 1 })).toBeNull(); // deeper than target
+    // Sliding window: tip grew so the target moved forward past the old low => skip.
+    const oldLow = TIP - DAYS * BLOCKS_PER_DAY; // old target start
+    expect(computeBackfillGap({ tip: TIP + 5000, days: DAYS, currentLow: oldLow })).toBeNull();
+  });
+
+  it('partial coverage (currentLow > targetStart) => older gap ONLY [targetStart..currentLow-1]', () => {
+    const currentLow = target + 500_000; // only partially deep
+    expect(computeBackfillGap({ tip: TIP, days: DAYS, currentLow })).toEqual({ start: target, end: currentLow - 1 });
+  });
+
+  it('deepening the config extends the gap down without re-walking covered heights', () => {
+    // Was backfilled 90 days deep; now configured for 1095 days.
+    const low90 = TIP - 90 * BLOCKS_PER_DAY;
+    const gap = computeBackfillGap({ tip: TIP, days: 1095, currentLow: low90 });
+    expect(gap).toEqual({ start: TIP - 1095 * BLOCKS_PER_DAY, end: low90 - 1 });
+    expect(gap.end).toBeLessThan(low90); // never re-touches already-covered heights
+  });
+
+  it('clamps the target start to 0 near genesis', () => {
+    expect(computeBackfillGap({ tip: 100, days: DAYS, currentLow: null })).toEqual({ start: 0, end: 100 });
+    expect(computeBackfillGap({ tip: 100, days: DAYS, currentLow: 0 })).toBeNull();
   });
 });
