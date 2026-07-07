@@ -53,6 +53,8 @@ const config = require('./config.js');
 // Network crawler (version-handshake reachability probe + 24h version stats)
 const { createCrawler, initializeCrawlerTables } = require('./crawler.js');
 const { createForkTracker, initializeForkTables } = require('./forktracker.js');
+// Historical daily per-algo stats (difficulty/hashrate reconstructed from headers)
+const history = require('./history.js');
 
 // ============================================================================
 // SERVER CONFIGURATION
@@ -359,6 +361,10 @@ let nodeCrawler = null;
 // Chain-tip / orphan / fork trackers (getchaintips poll; see forktracker.js)
 let forkTracker = null;
 let testnetForkTracker = null;
+
+// Historical daily per-algo stats handle (see history.js). Assigned in
+// startServer() after the HTTP server is listening; endpoints below guard null.
+let historyTracker = null;
 
 // ============================================================================
 // WEBSOCKET CONNECTION MANAGEMENT
@@ -2565,6 +2571,43 @@ app.get('/api/testnet/chaintips', (req, res) => {
   res.status(503).json({ error: 'Chain-tips data not yet available' });
 });
 
+// Historical per-algo difficulty / hashrate (reconstructed from headers; see
+// history.js). Daily: ?days=30 clamped [1,90], hashrate over 86400s, final
+// (today) entry partial. Hourly: ?hours=24 clamped [1,48], hashrate over 3600s,
+// final (current hour) entry partial. Twin routes for mainnet and testnet.
+async function handleHistoryDaily(network, req, res) {
+  if (!historyTracker) {
+    return res.status(503).json({ error: 'Historical data not yet available' });
+  }
+  try {
+    const days = history.clampDays(req.query.days);
+    const data = await historyTracker.getDaily(network, days);
+    res.json(data);
+  } catch (error) {
+    console.error(`Error in /api/${network === 'testnet' ? 'testnet/' : ''}history/daily:`, error);
+    res.status(500).json({ error: 'Error building daily history', details: error.message });
+  }
+}
+
+async function handleHistoryHourly(network, req, res) {
+  if (!historyTracker) {
+    return res.status(503).json({ error: 'Historical data not yet available' });
+  }
+  try {
+    const hours = history.clampHours(req.query.hours);
+    const data = await historyTracker.getHourly(network, hours);
+    res.json(data);
+  } catch (error) {
+    console.error(`Error in /api/${network === 'testnet' ? 'testnet/' : ''}history/hourly:`, error);
+    res.status(500).json({ error: 'Error building hourly history', details: error.message });
+  }
+}
+
+app.get('/api/history/daily', (req, res) => handleHistoryDaily('mainnet', req, res));
+app.get('/api/testnet/history/daily', (req, res) => handleHistoryDaily('testnet', req, res));
+app.get('/api/history/hourly', (req, res) => handleHistoryHourly('mainnet', req, res));
+app.get('/api/testnet/history/hourly', (req, res) => handleHistoryHourly('testnet', req, res));
+
 // ============================================================================
 // TESTNET PEER NETWORK MONITORING
 // ============================================================================
@@ -2632,7 +2675,12 @@ function refreshTestnetPeerDataFromNode() {
     return peerData;
   })();
 
-  testnetPeerRefreshPromise.finally(() => { testnetPeerRefreshPromise = null; });
+  // Reset the concurrency guard when done. The trailing .catch swallows the
+  // rejection on THIS branch so a testnet-offline failure (e.g. getaddrmaninfo
+  // unavailable) can't surface as an unhandled promise rejection and crash the
+  // whole (mainnet) server. Real consumers still observe the rejection via the
+  // returned promise (the /api/testnet/getpeers handler + Phase 3.5 try/catch).
+  testnetPeerRefreshPromise.finally(() => { testnetPeerRefreshPromise = null; }).catch(() => {});
   return testnetPeerRefreshPromise;
 }
 
@@ -4535,6 +4583,23 @@ async function startServer() {
       testnetForkTracker.start(30000);
     } else {
       console.log('- Fork tracker disabled (DGB_FORK_TRACKER_ENABLED=0)');
+    }
+
+    // Phase 5.7: Historical per-algo stats — reconstructs ~90-day daily and
+    // ~48h hourly difficulty/hashrate history from block headers (works on a
+    // pruned node), persisted in history.db. ENABLED BY DEFAULT — a plain
+    // `node server.js` runs it; set DGB_HISTORY_DISABLED=1 to turn it off.
+    // Non-blocking: backfill runs in the background; testnet is guarded so an
+    // offline testnet node stays silent/non-fatal.
+    if (process.env.DGB_HISTORY_DISABLED !== '1') {
+      historyTracker = history.init({
+        sendRpc: sendRpcRequest,
+        sendTestnetRpc: sendTestnetRpcRequest,
+        log: console.log,
+      });
+      console.log('✓ Historical stats started (daily 90d + hourly 48h; mainnet + testnet backfill in background)');
+    } else {
+      console.log('- Historical stats disabled (DGB_HISTORY_DISABLED=1)');
     }
 
     // Final status report

@@ -25,6 +25,9 @@ package-lock.json
 nodes.db
 package-lock.json
 nodes.db-journal
+history.db
+history.db-journal
+history.db-wal
 
 # config
 config.js

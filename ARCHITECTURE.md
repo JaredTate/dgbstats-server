@@ -53,13 +53,20 @@ dgbstats-server/                   # Root directory
 │   │   ├── Rate limiting
 │   │   └── DigiDollar/Oracle endpoints (testnet)
 │   │
+│   ├── history.js                 # Historical daily + hourly per-algo stats
+│   │   ├── foldHeadersBy / foldHeaders / foldHeadersHourly (pure aggregation)
+│   │   ├── buildDailyResponse / buildHourlyResponse (pure response builders)
+│   │   ├── createHistoryTracker (90d daily + 48h hourly backfill, 60s incremental)
+│   │   └── init() (opens history.db, kicks off mainnet + testnet jobs)
+│   │
 │   └── config.js                  # Environment configuration
 │       └── Development/production paths
 │
 ├── Configuration & Data
 │   ├── package.json               # Dependencies & scripts
 │   ├── vitest.config.js           # Test framework config
-│   ├── nodes.db                   # SQLite database
+│   ├── nodes.db                   # SQLite database (nodes, visits, crawler, forks)
+│   ├── history.db                 # SQLite database (daily + hourly per-algo stats)
 │   ├── cache-backup.json          # Persistent cache storage
 │   └── config.template.js         # Config template
 │
@@ -153,6 +160,49 @@ dgbstats-server/                   # Root directory
 | `confirmedTransactions` | Server→Client | Bulk confirmations via ZeroMQ |
 | `requestMempool` | Client→Server | Client requests mempool refresh |
 
+### 4. Historical Stats — daily + hourly (`history.js`)
+
+**Purpose**: Long-term per-algorithm difficulty and hashrate history at two
+resolutions — a ~90-day DAILY view and a ~48h HOURLY intraday view —
+reconstructed from block HEADERS so it works against a PRUNED node (pruned nodes
+retain every header). Persisted in its own `history.db` so it never contends
+with the peer/crawler/fork tables in `nodes.db`. **Enabled by default** (a plain
+`node server.js` runs it).
+
+**Aggregation model**: DigiByte retargets difficulty EVERY block per algo, so a
+bucket's representative value is the AVERAGE over all of that algo's blocks in
+the bucket. For each `(network, bucket, algo)` we persist `block_count`,
+`sum_difficulty`, `min/max/last_difficulty`, and `last_height`, in two tables:
+`daily_algo_stats` (bucket = UTC day) and `hourly_algo_stats` (bucket = UTC
+hour-start). Derived at query time:
+- `avgDifficulty = sum_difficulty / block_count`
+- `hashrate = 2^32 * sum_difficulty / secondsPerWindow`
+  (`secondsPerWindow` = 86400 for daily, 3600 for hourly)
+
+**Pure functions** (unit-tested): `foldHeadersBy(headers, bucketOf, keyName)` is
+the ONE shared implementation; `foldHeaders` (UTC day) and `foldHeadersHourly`
+(UTC hour, `YYYY-MM-DDTHH:00:00Z`) are thin wrappers. `buildDailyResponse` /
+`buildHourlyResponse` shape DB rows into the API contract (both delegate to
+`buildBucketResponse`) and flag the final (current) bucket `partial`.
+
+**Background jobs** (per network, all RPC wrapped in try/catch so an offline
+node aborts its own work without throwing):
+- **Daily backfill** — one-time walk of `[tip - 90*5760 .. tip]` via
+  `getblockhash` + `getblockheader` with bounded concurrency (~12 in flight);
+  folds the range and REPLACE-writes each day row (idempotent). Sets
+  `history_meta.last_height=tip, backfill_done=1`.
+- **Hourly backfill** — REPLACE-writes the last ~48h of `hourly_algo_stats` from
+  the same header source (bucketed by hour).
+- **Incremental updater** — every 60s, folds headers for `last_height+1 .. tip`,
+  ADDS them onto the affected DAILY and HOURLY rows, advances `last_height`, and
+  PRUNES hourly rows older than ~3 days so that table stays tiny.
+- **Startup sync** — after backfill/catch-up, REPLACE-recomputes both recent
+  windows (last 2 days, last 48h) to a single tip snapshot and sets the cursor
+  to it, so neither table is ever left with a gap or a double-counted block.
+
+Wired in from `server.js` after the HTTP server is listening
+(`history.init(...)`); **on by default**, turned off with `DGB_HISTORY_DISABLED=1`.
+
 ## API Endpoints
 
 ### Core Blockchain Endpoints
@@ -191,6 +241,14 @@ dgbstats-server/                   # Root directory
 | `/api/refreshcache` | POST | Manual cache refresh | Cache bypass |
 | `/health` | GET | Health check | - |
 
+### Chain-Tip & History Endpoints
+
+| Endpoint | Method | Purpose | Data Source |
+|----------|--------|---------|-------------|
+| `/api/chaintips` | GET | Chain-tip / orphan / fork snapshot | forktracker.js |
+| `/api/history/daily` | GET | Daily per-algo difficulty/hashrate (`?days=30`, clamped 1–90) | history.js / history.db |
+| `/api/history/hourly` | GET | Hourly per-algo difficulty/hashrate (`?hours=24`, clamped 1–48) | history.js / history.db |
+
 ## Testnet Support
 
 The server provides full testnet support with dedicated RPC connections, WebSocket server, and API routes. This allows developers to test applications against the DigiByte testnet without affecting mainnet operations.
@@ -221,6 +279,9 @@ All testnet endpoints mirror the mainnet API structure but are prefixed with `/a
 | `/api/testnet/getpeerinfo` | Testnet connected peers with geolocation |
 | `/api/testnet/getpeers` | Testnet peer discovery (testnet26/peers.dat) |
 | `/api/testnet/blocknotify` | Testnet block notification webhook (POST) |
+| `/api/testnet/chaintips` | Testnet chain-tip / orphan / fork snapshot |
+| `/api/testnet/history/daily` | Testnet daily per-algo difficulty/hashrate (`?days=30`) |
+| `/api/testnet/history/hourly` | Testnet hourly per-algo difficulty/hashrate (`?hours=24`) |
 
 ### DigiDollar/Oracle Endpoints (Testnet Only)
 
@@ -485,6 +546,119 @@ CREATE TABLE unique_ips (
 ```
 Purpose: Track unique visitor IPs for deduplication
 
+> `nodes.db` also holds the crawler-owned `crawled_nodes` table (see
+> `crawler.js`) and the fork-tracker's `orphan_blocks` table (see
+> `forktracker.js`).
+
+### SQLite Database (`history.db`)
+
+Separate file, owned by `history.js`, holding the reconstructed daily + hourly
+per-algo stats so it never contends with `nodes.db`.
+
+#### `daily_algo_stats` Table
+```sql
+CREATE TABLE daily_algo_stats (
+  network TEXT NOT NULL,       -- 'mainnet' | 'testnet'
+  day TEXT NOT NULL,           -- UTC 'YYYY-MM-DD'
+  algo TEXT NOT NULL,          -- SHA256D | Scrypt | Skein | Qubit | Odo | ...
+  block_count INTEGER,
+  sum_difficulty REAL,         -- sum of per-block difficulty that day
+  min_difficulty REAL,
+  max_difficulty REAL,
+  last_difficulty REAL,        -- from the highest height in the bucket
+  last_height INTEGER,
+  PRIMARY KEY (network, day, algo)
+);
+```
+Purpose: One row per network/day/algo. `avgDifficulty = sum_difficulty /
+block_count` and `hashrate = 2^32 * sum_difficulty / 86400` are derived at query
+time. Backfilled ~90 days deep.
+
+#### `hourly_algo_stats` Table
+```sql
+CREATE TABLE hourly_algo_stats (
+  network TEXT NOT NULL,       -- 'mainnet' | 'testnet'
+  hour TEXT NOT NULL,          -- UTC hour-start ISO, 'YYYY-MM-DDTHH:00:00Z'
+  algo TEXT NOT NULL,
+  block_count INTEGER,
+  sum_difficulty REAL,
+  min_difficulty REAL,
+  max_difficulty REAL,
+  last_difficulty REAL,
+  last_height INTEGER,
+  PRIMARY KEY (network, hour, algo)
+);
+```
+Purpose: Intraday ("last 24h") view. Same aggregation as daily but bucketed by
+UTC hour; `hashrate = 2^32 * sum_difficulty / 3600`. Backfilled ~48h deep and
+pruned to ~3 days each incremental tick so the table stays tiny.
+
+#### `history_meta` Table
+```sql
+CREATE TABLE history_meta (
+  network TEXT PRIMARY KEY,
+  last_height INTEGER,         -- highest height folded in so far
+  backfill_done INTEGER DEFAULT 0,
+  updated_at INTEGER
+);
+```
+Purpose: Per-network cursor + backfill flag so the incremental updater knows
+where to resume and backfill runs only once.
+
+#### `/api/history/daily` response contract
+```json
+{
+  "network": "mainnet",
+  "days": 30,
+  "generatedAt": 1751884800,
+  "algos": ["SHA256D", "Scrypt", "Skein", "Qubit", "Odo"],
+  "data": [
+    {
+      "date": "2026-07-05",
+      "partial": true,
+      "totalBlocks": 5760,
+      "perAlgo": {
+        "SHA256D": {
+          "blocks": 1152,
+          "avgDifficulty": 12345.6,
+          "minDifficulty": 12000.0,
+          "maxDifficulty": 12800.0,
+          "lastDifficulty": 12500.0,
+          "hashrate": 6.13e17
+        }
+      }
+    }
+  ]
+}
+```
+`data` is ordered oldest → newest; the final (today) entry is flagged
+`partial: true`.
+
+#### `/api/history/hourly` response contract
+Identical shape, with `days`→`hours`, each entry's `date`→`hour` (ISO hour
+string), and `hashrate = 2^32 * sum_difficulty / 3600`:
+```json
+{
+  "network": "mainnet",
+  "hours": 24,
+  "generatedAt": 1751884800,
+  "algos": ["SHA256D", "Scrypt", "Skein", "Qubit", "Odo"],
+  "data": [
+    {
+      "hour": "2026-07-07T14:00:00Z",
+      "partial": true,
+      "totalBlocks": 240,
+      "perAlgo": {
+        "SHA256D": { "blocks": 48, "avgDifficulty": 12345.6, "minDifficulty": 12000.0,
+                     "maxDifficulty": 12800.0, "lastDifficulty": 12500.0, "hashrate": 1.47e19 }
+      }
+    }
+  ]
+}
+```
+`data` is ordered oldest → newest; the final (current) hour is flagged
+`partial: true`.
+
 ## Server Startup Sequence
 
 ```
@@ -524,6 +698,9 @@ Phase 5: Schedule Periodic Tasks
 ├─ Confirmed transactions: every 30 seconds
 ├─ Mempool refresh: every 30 seconds
 ├─ Peer data refresh: every 10 minutes
+├─ Fork tracker poll: every 20s (mainnet) / 30s (testnet)
+├─ History: daily 90d + hourly 48h backfill (once) then incremental updater
+│    every 60s (folds daily + hourly, prunes hourly >3d); on by default
 └─ Cache persistence: every 60 seconds
 ```
 
