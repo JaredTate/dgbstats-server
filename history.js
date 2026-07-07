@@ -37,7 +37,12 @@ const SECONDS_PER_HOUR = 3600;
 const POW32 = Math.pow(2, 32);
 
 // Backfill / retention windows.
-const DAILY_BACKFILL_DAYS = 1095; // ~3 years of daily history (supports 6M / 1Y / 3Y views)
+// Genesis-covering: DigiByte launched 2014-01-10 (~4,560 days ago). 6000 days
+// (~16.4 years) keeps the deep-backfill target pinned to block 0 for years to
+// come, so the "5Y" and "All" chart ranges have data all the way to genesis.
+// (computeBackfillGap clamps the start height to 0, so an over-large value just
+// means "walk to genesis".)
+const DAILY_BACKFILL_DAYS = 6000;
 const HOURLY_BACKFILL_HOURS = 48; // ~2 days of hourly history on startup
 const HOURLY_RETENTION_DAYS = 3; // prune hourly rows older than this each tick
 // Deep daily backfill walks in chunks of this many heights so the ~6.3M-header
@@ -425,7 +430,7 @@ function createHistoryTracker({
   days = DAILY_BACKFILL_DAYS,
   hours = HOURLY_BACKFILL_HOURS,
   hourlyRetentionDays = HOURLY_RETENTION_DAYS,
-  concurrency = 12,
+  concurrency = 16,
   intervalMs = 60000,
   log = () => {},
   nowFn = () => Date.now(),
@@ -778,7 +783,7 @@ function clampInt(value, def, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/** Clamp a ?days= query value into [1, 1095] (up to ~3 years), defaulting to 30. */
+/** Clamp a ?days= query value into [1, DAILY_BACKFILL_DAYS] (up to genesis), defaulting to 30. */
 function clampDays(value, def = 30, min = 1, max = DAILY_BACKFILL_DAYS) {
   return clampInt(value, def, min, max);
 }

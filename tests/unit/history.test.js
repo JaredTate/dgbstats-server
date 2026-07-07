@@ -177,9 +177,11 @@ describe('sortAlgos / clampDays helpers', () => {
     expect(clampDays('abc')).toBe(30);
     expect(clampDays('7')).toBe(7);
     expect(clampDays('0')).toBe(1);
-    expect(clampDays('365')).toBe(365); // 1-year view now allowed
-    expect(clampDays('1095')).toBe(1095); // 3-year max
-    expect(clampDays('99999')).toBe(1095); // clamped to the 3-year bound
+    expect(clampDays('365')).toBe(365); // 1-year view
+    expect(clampDays('1095')).toBe(1095); // 3-year view
+    expect(clampDays('1825')).toBe(1825); // 5-year view
+    expect(clampDays('6000')).toBe(6000); // genesis-covering "All" max
+    expect(clampDays('99999')).toBe(6000); // clamped to the genesis bound
   });
 
   it('clamps hours into [1,48] with a default of 24', () => {
