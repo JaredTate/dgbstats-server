@@ -968,16 +968,26 @@ function decodeCoinbaseData(coinbaseHex) {
  * 
  * @returns {Promise<Array>} Array of recent block objects
  */
+let mainnetRefreshInFlight = false;
+
 async function fetchLatestBlocks() {
+  // A slow node (e.g. mid-IBD) can make one refresh outlast the 60s interval;
+  // overlapping refreshes hammer the RPC and interleave their stages. Skip
+  // the cycle instead — the in-flight refresh will land shortly.
+  if (mainnetRefreshInFlight) {
+    console.log('Recent blocks refresh already in flight — skipping this cycle');
+    return recentBlocks;
+  }
+  mainnetRefreshInFlight = true;
   try {
     console.log('Refreshing recent blocks cache...');
-    
+
     // Get current blockchain tip
     const blockchainInfo = await sendRpcRequest('getblockchaininfo');
     if (!blockchainInfo) {
       throw new Error('Unable to fetch blockchain info');
     }
-    
+
     const latestBlockHeight = blockchainInfo.blocks;
     console.log(`Current blockchain height: ${latestBlockHeight}`);
 
@@ -985,24 +995,26 @@ async function fetchLatestBlocks() {
     // this refresh runs (or fetched by the previous refresh) must survive a
     // slightly-stale range fetch — never let the tip regress.
     const previousBlocks = [...recentBlocks];
-    recentBlocks.length = 0;
 
     // Request more blocks than needed (10% buffer)
     const requestedBlocks = Math.ceil(SERVER_CONFIG.maxRecentBlocks * 1.1);
 
-    // Fetch blocks using optimized batch processing
+    // Build the refreshed list in a STAGING array. The live cache must keep
+    // serving clients that connect while this (potentially minutes-long on a
+    // busy node) fetch runs — emptying recentBlocks up front left every
+    // on-connect delivery with 0 blocks whenever a refresh was in progress.
     console.log(`Requesting ${requestedBlocks} blocks from height ${latestBlockHeight}`);
+    const staging = [];
     const fetchedBlocks = await getBlocksByTimeRange(0, latestBlockHeight, requestedBlocks);
-
-    // Add fetched blocks to our cache
-    recentBlocks.push(...fetchedBlocks);
+    staging.push(...fetchedBlocks);
 
     // If we don't have enough blocks, fetch additional ones individually
-    await fillRemainingBlocks(latestBlockHeight);
+    await fillRemainingBlocks(staging, latestBlockHeight);
 
     // Merge with the snapshot: dedupe by hash (fresh copy wins), newest first,
-    // capped at the cache size.
-    const merged = mergeRecentBlocks(previousBlocks, recentBlocks, SERVER_CONFIG.maxRecentBlocks);
+    // capped at the cache size. Only now does the live cache change — one
+    // atomic swap.
+    const merged = mergeRecentBlocks(previousBlocks, staging, SERVER_CONFIG.maxRecentBlocks);
     recentBlocks.length = 0;
     recentBlocks.push(...merged);
 
@@ -1019,6 +1031,8 @@ async function fetchLatestBlocks() {
   } catch (error) {
     console.error('Error fetching latest blocks:', error);
     return [];
+  } finally {
+    mainnetRefreshInFlight = false;
   }
 }
 
@@ -1027,29 +1041,29 @@ async function fetchLatestBlocks() {
  * 
  * @param {number} latestHeight - Current blockchain height
  */
-async function fillRemainingBlocks(latestHeight) {
-  if (recentBlocks.length >= SERVER_CONFIG.maxRecentBlocks || latestHeight < SERVER_CONFIG.maxRecentBlocks) {
+async function fillRemainingBlocks(target, latestHeight) {
+  if (target.length >= SERVER_CONFIG.maxRecentBlocks || latestHeight < SERVER_CONFIG.maxRecentBlocks) {
     return; // Already have enough blocks or blockchain is too short
   }
 
-  console.log(`Need ${SERVER_CONFIG.maxRecentBlocks - recentBlocks.length} more blocks, fetching individually...`);
-  
+  console.log(`Need ${SERVER_CONFIG.maxRecentBlocks - target.length} more blocks, fetching individually...`);
+
   // Find the lowest height we already have
-  const lowestHeight = recentBlocks.reduce((min, block) => 
+  const lowestHeight = target.reduce((min, block) =>
     Math.min(min, block.height), Number.MAX_SAFE_INTEGER);
-  
+
   // Fetch older blocks one by one
   let currentHeight = lowestHeight - 1;
-  while (recentBlocks.length < SERVER_CONFIG.maxRecentBlocks && currentHeight > 0) {
+  while (target.length < SERVER_CONFIG.maxRecentBlocks && currentHeight > 0) {
     try {
       const blockData = await fetchSingleBlockForCache(currentHeight);
       if (blockData) {
-        recentBlocks.push(blockData);
+        target.push(blockData);
       }
     } catch (error) {
       console.error(`Error fetching block at height ${currentHeight}:`, error.message);
     }
-    
+
     currentHeight--;
   }
 }
@@ -1648,25 +1662,28 @@ async function fetchTestnetLatestBlocks() {
     // Snapshot the current cache so blocknotify-delivered blocks survive a
     // slightly-stale refresh (same merge semantics as mainnet).
     const previousBlocks = [...testnetRecentBlocks];
-    testnetRecentBlocks.length = 0;
 
-    // Fetch blocks individually for testnet (simpler approach)
+    // Fetch blocks individually for testnet (simpler approach) into a STAGING
+    // array — the live cache keeps serving connecting clients while this
+    // (per-block, potentially slow) refresh runs.
     const blocksToFetch = Math.min(SERVER_CONFIG.maxRecentBlocks, latestBlockHeight);
+    const staging = [];
 
     for (let i = 0; i < blocksToFetch; i++) {
       const height = latestBlockHeight - i;
       try {
         const blockData = await fetchSingleTestnetBlockForCache(height);
         if (blockData) {
-          testnetRecentBlocks.push(blockData);
+          staging.push(blockData);
         }
       } catch (error) {
         console.error(`Testnet: Error fetching block at height ${height}:`, error.message);
       }
     }
 
-    // Merge with the snapshot: dedupe by hash, newest first, capped.
-    const merged = mergeRecentBlocks(previousBlocks, testnetRecentBlocks, SERVER_CONFIG.maxRecentBlocks);
+    // Merge with the snapshot: dedupe by hash, newest first, capped — one
+    // atomic swap of the live cache.
+    const merged = mergeRecentBlocks(previousBlocks, staging, SERVER_CONFIG.maxRecentBlocks);
     testnetRecentBlocks.length = 0;
     testnetRecentBlocks.push(...merged);
 
