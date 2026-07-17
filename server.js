@@ -41,6 +41,7 @@ const {
   getTransactionData,
   getAlgoName,
   classifyBlockVersion,
+  detectOracleBundle,
   extractPoolIdentifier,
   mergeRecentBlocks,
   getBlocksByTimeRange,
@@ -1088,6 +1089,7 @@ async function fetchSingleBlockForCache(height) {
     minerAddress,
     poolIdentifier,
     ...classifyBlockVersion(block.version),
+    ...detectOracleBundle(block),
     version: block.version
   };
 }
@@ -1139,6 +1141,7 @@ app.post('/api/blocknotify', async (req, res) => {
       minerAddress,
       poolIdentifier,
       ...classifyBlockVersion(fullBlock.version),
+      ...detectOracleBundle(fullBlock),
       version: fullBlock.version
     };
 
@@ -1379,6 +1382,7 @@ app.post('/api/testnet/blocknotify', async (req, res) => {
       minerAddress,
       poolIdentifier,
       ...classifyBlockVersion(fullBlock.version),
+      ...detectOracleBundle(fullBlock),
       version: fullBlock.version
     };
 
@@ -1715,6 +1719,7 @@ async function fetchSingleTestnetBlockForCache(height) {
     minerAddress,
     poolIdentifier,
     ...classifyBlockVersion(block.version),
+    ...detectOracleBundle(block),
     version: block.version
   };
 }
@@ -4213,9 +4218,10 @@ async function handleRawBlocks() {
           minerAddress,
           poolIdentifier,
           ...classifyBlockVersion(fullBlock.version),
+          ...detectOracleBundle(fullBlock),
           version: fullBlock.version
         };
-        
+
         updateRecentBlocksCache(newBlock);
         broadcastNewBlock(newBlock);
         

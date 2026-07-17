@@ -476,6 +476,110 @@ function classifyBlockVersion(version) {
   };
 }
 
+// ============================================================================
+// DIGIDOLLAR ORACLE BUNDLE DETECTION (consensus-strict v0x03)
+// ============================================================================
+// Per DIGIDOLLAR_ORACLE_ARCHITECTURE.md (V1 invariants) and
+// DIGIDOLLAR_MINING_INTEGRATION_GUIDE.md in the DigiByte Core repo:
+// - The bundle is a zero-value COINBASE output (block.tx[0]) — it is NOT a
+//   block-header field; the header commits to it only via the merkle root.
+//   Script: OP_RETURN(0x6a) OP_ORACLE(0xbf) <push 0x03> <push v03 payload>
+// - V1 accepts ONLY v0x03 MuSig2 bundles. Raw v0x01/v0x02 payloads are
+//   consensus-rejected (bad-oracle-malformed) and must not count here.
+// - v03 payload (core: src/primitives/oracle.cpp SerializeV03Data):
+//     bitmap_len(1) | participation_bitmap(bitmap_len) | epoch(4 LE) |
+//     price_micro_usd(8 LE u64) | timestamp(8 LE i64) | aggregate_sig(64)
+//   Exact length: 85 + bitmap_len (86 minimum; 90 on the 35-slot roster).
+// - Consensus price bounds: 100..100,000,000 micro-USD ($0.0001..$100).
+// - Pre-activation blocks were never oracle-validated, so a stray 0x6abf
+//   marker alone is NOT proof of a bundle — only a payload that parses as
+//   structurally valid v0x03 counts. Post-activation, consensus guarantees
+//   every attached bundle passes these checks, so strict parsing never
+//   under-counts real bundles.
+// Detection needs only the getblock verbosity-2 JSON every block pipeline
+// here already fetches — zero additional RPC calls.
+
+const ORACLE_MIN_PRICE_MICRO_USD = 100n;         // $0.0001 per DGB
+const ORACLE_MAX_PRICE_MICRO_USD = 100000000n;   // $100.00 per DGB
+const ORACLE_MAX_BITMAP_LEN = 32;                // generous cap (mainnet uses 5)
+
+function popcountByte(byte) {
+  let x = byte & 0xff;
+  let n = 0;
+  while (x) { n += x & 1; x >>= 1; }
+  return n;
+}
+
+/** Read one script data push at offset i. Returns {data, next} or null. */
+function readPush(script, i) {
+  const op = script[i];
+  if (op >= 0x01 && op <= 0x4b) {
+    if (i + 1 + op > script.length) return null;
+    return { data: script.subarray(i + 1, i + 1 + op), next: i + 1 + op };
+  }
+  if (op === 0x4c) { // OP_PUSHDATA1
+    const len = script[i + 1];
+    if (len == null || i + 2 + len > script.length) return null;
+    return { data: script.subarray(i + 2, i + 2 + len), next: i + 2 + len };
+  }
+  return null;
+}
+
+/**
+ * Detect and decode a DigiDollar v0x03 oracle bundle on a block's coinbase.
+ *
+ * @param {object} fullBlock - getblock verbosity-2 result (tx array decoded)
+ * @returns {{hasOracleBundle: boolean, oracleSignerCount: number|null, oraclePriceUsd: number|null, oracleEpoch: number|null}}
+ */
+function detectOracleBundle(fullBlock) {
+  const none = { hasOracleBundle: false, oracleSignerCount: null, oraclePriceUsd: null, oracleEpoch: null };
+  const coinbase = fullBlock && Array.isArray(fullBlock.tx) ? fullBlock.tx[0] : null;
+  if (!coinbase || !Array.isArray(coinbase.vout)) return none;
+
+  for (const output of coinbase.vout) {
+    const hex = output && output.scriptPubKey && typeof output.scriptPubKey.hex === 'string'
+      ? output.scriptPubKey.hex.toLowerCase()
+      : '';
+    if (!hex.startsWith('6abf')) continue; // OP_RETURN OP_ORACLE marker
+
+    try {
+      const script = Buffer.from(hex, 'hex');
+
+      // Version push: must be exactly one byte, value 0x03 (MuSig2 v3).
+      const versionPush = readPush(script, 2);
+      if (!versionPush || versionPush.data.length !== 1 || versionPush.data[0] !== 0x03) continue;
+
+      // Payload push: must be exactly 85 + bitmap_len bytes.
+      const payloadPush = readPush(script, versionPush.next);
+      if (!payloadPush) continue;
+      const payload = payloadPush.data;
+      if (payload.length < 1) continue;
+      const bitmapLen = payload[0];
+      if (!bitmapLen || bitmapLen > ORACLE_MAX_BITMAP_LEN) continue;
+      if (payload.length !== 1 + bitmapLen + 4 + 8 + 8 + 64) continue;
+
+      const priceMicroUsd = payload.readBigUInt64LE(1 + bitmapLen + 4);
+      if (priceMicroUsd < ORACLE_MIN_PRICE_MICRO_USD || priceMicroUsd > ORACLE_MAX_PRICE_MICRO_USD) continue;
+
+      let signerCount = 0;
+      for (let b = 1; b <= bitmapLen; b++) signerCount += popcountByte(payload[b]);
+      const epoch = payload.readInt32LE(1 + bitmapLen);
+
+      return {
+        hasOracleBundle: true,
+        oracleSignerCount: signerCount,
+        oraclePriceUsd: Number(priceMicroUsd) / 1e6,
+        oracleEpoch: epoch,
+      };
+    } catch (error) {
+      // Undecodable script — not a valid bundle.
+      continue;
+    }
+  }
+
+  return none;
+}
+
 /**
  * Merge freshly fetched blocks with blocks already in the cache.
  *
@@ -665,6 +769,8 @@ async function processBlockForStats(blockHash) {
       digidollarSignaling: signals.digidollarSignaling,
       algolockSignaling: signals.algolockSignaling,
       versionRolled: signals.versionRolled,
+      // Per-block DigiDollar oracle bundle (v0x03 OP_RETURN OP_ORACLE coinbase output)
+      ...detectOracleBundle(block),
       version: block.version
     };
     
@@ -1416,6 +1522,7 @@ module.exports = {
   getTransactionData,
   getAlgoName,
   classifyBlockVersion,
+  detectOracleBundle,
   extractPoolIdentifier,
   mergeRecentBlocks,
   getBlocksByTimeRange,
