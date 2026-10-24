@@ -268,4 +268,72 @@ describe.skipIf(!HAS_CONFIG)('server.js process', () => {
       expect(tables).toEqual(expect.arrayContaining(['nodes', 'visits', 'unique_ips']));
     });
   });
+
+  describe('mainnet newBlock broadcast dedupe', () => {
+    test('ZMQ first, then blocknotify: one newBlock', async () => {
+      const { header, block } = makeBlock(6);
+      mainnetRpc.addBlock(block);
+
+      await publisher.send(['rawblock', header]);
+      await server.waitForLog(new RegExp(`New block via ZeroMQ: ${block.hash}`), 5000);
+      expect(await postJson(ports.http, '/api/blocknotify', { blockhash: block.hash })).toBe(200);
+      await sleep(500);
+
+      expect(countFor(mainClient.newBlocks, block.hash)).toBe(1);
+    });
+
+    test('blocknotify first, then ZMQ: one newBlock', async () => {
+      const { header, block } = makeBlock(7);
+      mainnetRpc.addBlock(block);
+
+      expect(await postJson(ports.http, '/api/blocknotify', { blockhash: block.hash })).toBe(200);
+      await publisher.send(['rawblock', header]);
+      await server.waitForLog(new RegExp(`New block via ZeroMQ: ${block.hash}`), 5000);
+      await sleep(500);
+
+      expect(countFor(mainClient.newBlocks, block.hash)).toBe(1);
+    });
+
+    test('a different block at the same height (reorg) still broadcasts', async () => {
+      const { block: original } = makeBlock(8);
+      const { header, block: competitor } = makeBlock(8);
+      mainnetRpc.addBlock(original);
+      mainnetRpc.addBlock(competitor);
+
+      expect(await postJson(ports.http, '/api/blocknotify', { blockhash: original.hash })).toBe(200);
+      await publisher.send(['rawblock', header]);
+      await server.waitForLog(new RegExp(`New block via ZeroMQ: ${competitor.hash}`), 5000);
+      await sleep(500);
+
+      expect(countFor(mainClient.newBlocks, original.hash)).toBe(1);
+      expect(countFor(mainClient.newBlocks, competitor.hash)).toBe(1);
+    });
+  });
+
+  describe('testnet newBlock broadcast dedupe', () => {
+    test('the same block notified twice broadcasts once', async () => {
+      const { block } = makeBlock(6);
+      testnetRpc.addBlock(block);
+
+      expect(await postJson(ports.http, '/api/testnet/blocknotify', { blockhash: block.hash })).toBe(200);
+      expect(await postJson(ports.http, '/api/testnet/blocknotify', { blockhash: block.hash })).toBe(200);
+      await sleep(500);
+
+      expect(countFor(testClient.newBlocks, block.hash)).toBe(1);
+    });
+
+    test('a different block at the same height still broadcasts', async () => {
+      const { block: a } = makeBlock(7);
+      const { block: b } = makeBlock(7);
+      testnetRpc.addBlock(a);
+      testnetRpc.addBlock(b);
+
+      expect(await postJson(ports.http, '/api/testnet/blocknotify', { blockhash: a.hash })).toBe(200);
+      expect(await postJson(ports.http, '/api/testnet/blocknotify', { blockhash: b.hash })).toBe(200);
+      await sleep(500);
+
+      expect(countFor(testClient.newBlocks, a.hash)).toBe(1);
+      expect(countFor(testClient.newBlocks, b.hash)).toBe(1);
+    });
+  });
 });

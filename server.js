@@ -44,6 +44,7 @@ const {
   detectOracleBundle,
   extractPoolIdentifier,
   mergeRecentBlocks,
+  createSeenBlockFilter,
   getBlocksByTimeRange,
   fetchPeersFromNode
 } = require('./rpc');
@@ -1335,7 +1336,16 @@ function broadcastRecentBlocksIfChanged() {
   }
 }
 
+// Each block arrives via both ZMQ rawblock and blocknotify; broadcast it once.
+const isNewMainnetBlock = createSeenBlockFilter();
+const isNewTestnetBlock = createSeenBlockFilter();
+
 function broadcastNewBlock(newBlock) {
+  if (!isNewMainnetBlock(newBlock.hash)) {
+    console.log(`Block ${newBlock.height} already broadcast - skipping duplicate`);
+    return;
+  }
+
   const message = JSON.stringify({
     type: 'newBlock',
     data: newBlock
@@ -1801,6 +1811,11 @@ function broadcastTestnetRecentBlocksIfChanged() {
 }
 
 function broadcastTestnetNewBlock(newBlock) {
+  if (!isNewTestnetBlock(newBlock.hash)) {
+    console.log(`Testnet: Block ${newBlock.height} already broadcast - skipping duplicate`);
+    return;
+  }
+
   const message = JSON.stringify({
     type: 'newBlock',
     data: newBlock

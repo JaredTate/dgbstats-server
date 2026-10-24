@@ -581,6 +581,27 @@ function detectOracleBundle(fullBlock) {
 }
 
 /**
+ * Remember recently seen block hashes so each block is broadcast once.
+ *
+ * A new block reaches the server via ZMQ rawblock AND the blocknotify POST.
+ * The returned function returns true only the first time it sees a hash, so
+ * the fastest path broadcasts and the slower one is skipped. A different hash
+ * at the same height (reorg) is still new. Keeps the last `max` hashes.
+ *
+ * @param {number} max - How many recent hashes to remember
+ * @returns {(hash: string) => boolean} true if the hash was not seen before
+ */
+function createSeenBlockFilter(max = 1000) {
+  const seen = new Set();
+  return (hash) => {
+    if (seen.has(hash)) return false;
+    seen.add(hash);
+    if (seen.size > max) seen.delete(seen.values().next().value);
+    return true;
+  };
+}
+
+/**
  * Merge freshly fetched blocks with blocks already in the cache.
  *
  * The 60s refresh can complete with a slightly stale view of the tip while
@@ -1525,6 +1546,7 @@ module.exports = {
   detectOracleBundle,
   extractPoolIdentifier,
   mergeRecentBlocks,
+  createSeenBlockFilter,
   getBlocksByTimeRange,
   preloadEssentialData,
   getCacheStats,
