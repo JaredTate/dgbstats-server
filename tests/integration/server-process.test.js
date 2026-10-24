@@ -66,8 +66,11 @@ function makeBlock(height) {
   };
 }
 
-/** Minimal JSON-RPC node: a short chain plus any extra blocks the test registers. */
-function startMockRpc(chain) {
+/**
+ * Minimal JSON-RPC node: a short chain plus any extra blocks the test registers.
+ * Methods listed in `failMethods` answer with an RPC error.
+ */
+function startMockRpc(chain, { failMethods = [] } = {}) {
   const byHash = new Map(chain.map((b) => [b.hash, b]));
   const byHeight = new Map(chain.map((b) => [b.height, b]));
   const tip = () => chain[chain.length - 1];
@@ -97,7 +100,7 @@ function startMockRpc(chain) {
       let reply;
       try {
         const { id, method, params = [] } = JSON.parse(body);
-        const fn = handlers[method];
+        const fn = failMethods.includes(method) ? null : handlers[method];
         reply = fn
           ? { id, result: fn(params), error: null }
           : { id, result: null, error: { code: -32601, message: 'Method not found' } };
@@ -117,6 +120,39 @@ function startMockRpc(chain) {
         close: () => new Promise((r) => server.close(r)),
       });
     });
+  });
+}
+
+/** Env for a spawned server.js: isolated ports, mock RPC, extras disabled. */
+function serverEnv({ ports, mainnetUrl, testnetUrl }) {
+  return {
+    PORT: String(ports.http),
+    DGB_WS_PORT: String(ports.ws),
+    DGB_TESTNET_WS_PORT: String(ports.testnetWs),
+    DGB_MAINNET_PRE_WS_PORT: String(ports.preWs),
+    DGB_ZMQ_RAWBLOCK: `tcp://127.0.0.1:${ports.zmq}`,
+    DGB_RPC_URL: mainnetUrl,
+    DGB_TESTNET_RPC_URL: testnetUrl,
+    DGB_MAINNET_PRE_ENABLED: 'false',
+    DGB_CRAWLER_ENABLED: '0',
+    DGB_FORK_TRACKER_ENABLED: '0',
+    DGB_HISTORY_DISABLED: '1',
+  };
+}
+
+async function allocatePorts() {
+  return {
+    http: await freePort(), ws: await freePort(), testnetWs: await freePort(),
+    preWs: await freePort(), zmq: await freePort(),
+  };
+}
+
+function getStatus(port, urlPath) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: urlPath }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    }).on('error', reject);
   });
 }
 
@@ -217,28 +253,13 @@ describe.skipIf(!HAS_CONFIG)('server.js process', () => {
     mainnetRpc = await startMockRpc(mainChain);
     testnetRpc = await startMockRpc(testChain);
 
-    ports = {
-      http: await freePort(), ws: await freePort(), testnetWs: await freePort(),
-      preWs: await freePort(), zmq: await freePort(),
-    };
+    ports = await allocatePorts();
     publisher = new zmq.Publisher();
     await publisher.bind(`tcp://127.0.0.1:${ports.zmq}`);
 
     server = spawnServer({
       cwd: tmpDir,
-      env: {
-        PORT: String(ports.http),
-        DGB_WS_PORT: String(ports.ws),
-        DGB_TESTNET_WS_PORT: String(ports.testnetWs),
-        DGB_MAINNET_PRE_WS_PORT: String(ports.preWs),
-        DGB_ZMQ_RAWBLOCK: `tcp://127.0.0.1:${ports.zmq}`,
-        DGB_RPC_URL: mainnetRpc.url,
-        DGB_TESTNET_RPC_URL: testnetRpc.url,
-        DGB_MAINNET_PRE_ENABLED: 'false',
-        DGB_CRAWLER_ENABLED: '0',
-        DGB_FORK_TRACKER_ENABLED: '0',
-        DGB_HISTORY_DISABLED: '1',
-      },
+      env: serverEnv({ ports, mainnetUrl: mainnetRpc.url, testnetUrl: testnetRpc.url }),
     });
 
     await server.waitForLog(/ZeroMQ initialization complete/);
@@ -335,5 +356,48 @@ describe.skipIf(!HAS_CONFIG)('server.js process', () => {
       expect(countFor(testClient.newBlocks, a.hash)).toBe(1);
       expect(countFor(testClient.newBlocks, b.hash)).toBe(1);
     });
+  });
+});
+
+// A failing getaddrmaninfo made refreshMainnetPeerData() reject. Its
+// `.finally()` side-promise had no catch, so the rejection was unhandled and
+// Node exited the whole process.
+describe.skipIf(!HAS_CONFIG)('server.js process: getaddrmaninfo failure', () => {
+  let tmpDir;
+  let mainnetRpc;
+  let testnetRpc;
+  let server;
+  let ports;
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dgbstats-proc-'));
+    const chain = () => [1, 2, 3, 4, 5].map((h) => makeBlock(h).block);
+    mainnetRpc = await startMockRpc(chain(), { failMethods: ['getaddrmaninfo'] });
+    testnetRpc = await startMockRpc(chain());
+    ports = await allocatePorts();
+
+    server = spawnServer({
+      cwd: tmpDir,
+      env: serverEnv({ ports, mainnetUrl: mainnetRpc.url, testnetUrl: testnetRpc.url }),
+    });
+    await server.waitForLog(/Error fetching peer data from node: address-manager RPC \(getaddrmaninfo\) returned no data/);
+    // The crash (if any) follows the rejection immediately; give it time.
+    await sleep(1000);
+  });
+
+  afterAll(async () => {
+    await server?.stop();
+    await mainnetRpc?.close();
+    await testnetRpc?.close();
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('stays up and keeps serving /health', async () => {
+    expect(server.exited).toBeNull();
+    expect(await getStatus(ports.http, '/health')).toBe(200);
+  });
+
+  test('logs the peer refresh failure', () => {
+    expect(server.output).toMatch(/Mainnet peer refresh failed: address-manager RPC \(getaddrmaninfo\) returned no data/);
   });
 });

@@ -2515,7 +2515,11 @@ function refreshMainnetPeerData() {
     return peerData;
   })();
 
-  mainnetPeerRefreshPromise.finally(() => { mainnetPeerRefreshPromise = null; });
+  // Callers handle the returned promise; this side-promise also needs a catch,
+  // or a failed refresh is an unhandled rejection and Node exits the process.
+  mainnetPeerRefreshPromise
+    .finally(() => { mainnetPeerRefreshPromise = null; })
+    .catch((err) => console.error('Mainnet peer refresh failed:', err.message));
   return mainnetPeerRefreshPromise;
 }
 
