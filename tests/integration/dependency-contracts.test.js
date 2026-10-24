@@ -177,6 +177,16 @@ describe('geoip-lite contract', () => {
     }
   );
 
+  // Real DigiByte peer IPs (2026-10-24) that geoip-lite 1.4.10's bundled data
+  // locates but 2.0.3's smaller dataset does not (~370 of 5,500 peers lost
+  // from the /nodes map). Guards against shipping a dataset with less coverage.
+  it.each([
+    '102.216.113.225', '102.32.106.130', '102.33.32.1', '103.177.190.66', '103.53.30.217',
+    '170.39.103.164', '176.56.39.115', '193.176.244.74', '45.146.55.137', '45.153.35.147',
+  ])('geolocates real peer %s', (ip) => {
+    expectShape(geoip.lookup(ip));
+  });
+
   it('does not stall on a very long IPv6-like string', () => {
     const t0 = Date.now();
     expect(() => geoip.lookup('2001:db8::1%' + 'a'.repeat(100000))).not.toThrow();
