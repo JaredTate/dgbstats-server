@@ -27,9 +27,9 @@
     "zeromq": "^6.4.2"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^1.6.0",
+    "@vitest/coverage-v8": "^5.0.5",
     "concurrently": "^8.2.2",
     "supertest": "^6.3.4",
-    "vitest": "^1.6.0"
+    "vitest": "^5.0.5"
   }
 }

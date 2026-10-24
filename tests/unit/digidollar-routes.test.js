@@ -22,7 +22,7 @@ describe('DigiDollar production RPC routes', () => {
     process.env.DGB_MAINNET_PRE_RPC_PASSWORD = 'pre-pass';
     process.env.DGB_MAINNET_PRE_RPC_URL = 'http://127.0.0.1:14046';
 
-    axios.post.mockImplementation((url, body) => Promise.resolve({
+    vi.spyOn(axios, 'post').mockImplementation((url, body) => Promise.resolve({
       data: {
         result: {
           url,

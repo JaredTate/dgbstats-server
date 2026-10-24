@@ -461,7 +461,7 @@ describe('RPC Cache Behavior', () => {
     mockCache = createMockCache();
     
     // Mock NodeCache constructor
-    vi.mock('node-cache', () => {
+    vi.doMock('node-cache', () => {
       return vi.fn().mockImplementation(() => mockCache);
     });
     

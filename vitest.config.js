@@ -37,12 +37,9 @@ export default defineConfig({
     // Globals
     globals: true,
     
-    // Pool options for better performance
+    // Run test files one at a time in a forked process (integration tests
+    // bind fixed ports). Vitest 4+ replaced poolOptions.forks.singleFork.
     pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true
-      }
-    }
+    maxWorkers: 1
   }
 });
