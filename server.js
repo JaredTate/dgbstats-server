@@ -49,6 +49,9 @@ const {
   fetchPeersFromNode
 } = require('./rpc');
 
+// Real transaction fee helpers (never estimate a fee)
+const { blockTxFee, mempoolEntryFee, feeFields, addToFeeDistribution, emptyFeeDistribution, averageKnownFee } = require('./txfee.js');
+
 // Load application configuration
 const config = require('./config.js');
 
@@ -164,13 +167,7 @@ let mempoolCache = {
     minfee: 0,
     avgfee: 0,
     totalfee: 0,
-    feeDistribution: {
-      '0-10': 0,
-      '10-50': 0,
-      '50-100': 0,
-      '100-500': 0,
-      '500+': 0
-    }
+    feeDistribution: emptyFeeDistribution()
   },
   transactions: []
 };
@@ -226,13 +223,7 @@ let testnetMempoolCache = {
     minfee: 0,
     avgfee: 0,
     totalfee: 0,
-    feeDistribution: {
-      '0-10': 0,
-      '10-50': 0,
-      '50-100': 0,
-      '100-500': 0,
-      '500+': 0
-    }
+    feeDistribution: emptyFeeDistribution()
   },
   transactions: []
 };
@@ -749,13 +740,7 @@ async function sendMempoolDataToClient(ws) {
     const transactions = [];
     const txIds = Object.keys(rawMempool || {});
     let totalFee = 0;
-    const feeDistribution = {
-      '0-10': 0,
-      '10-50': 0,
-      '50-100': 0,
-      '100-500': 0,
-      '500+': 0
-    };
+    const feeDistribution = emptyFeeDistribution();
     
     // Limit to 50 transactions for performance to avoid overwhelming the frontend
     for (const txid of txIds.slice(0, 50)) {
@@ -767,19 +752,10 @@ async function sendMempoolDataToClient(ws) {
         const enhancedTxData = await getTransactionData(txid);
         
         // Calculate fee rate (satoshis per byte)
-        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+        const { fee: txFee, fee_rate: feeRate, priority } = feeFields(mempoolEntryFee(txData), txData.vsize || txData.size);
         
         // Update fee distribution
-        if (feeRate < 10) feeDistribution['0-10']++;
-        else if (feeRate < 50) feeDistribution['10-50']++;
-        else if (feeRate < 100) feeDistribution['50-100']++;
-        else if (feeRate < 500) feeDistribution['100-500']++;
-        else feeDistribution['500+']++;
-        
-        // Determine priority based on fee rate
-        let priority = 'low';
-        if (feeRate > 100) priority = 'high';
-        else if (feeRate > 50) priority = 'medium';
+        addToFeeDistribution(feeDistribution, feeRate);
         
         // Calculate transaction value
         let totalValue = 0;
@@ -821,13 +797,13 @@ async function sendMempoolDataToClient(ws) {
           }
         }
         
-        totalFee += txData.fee || 0;
+        totalFee += txFee || 0;
         
         transactions.push({
           txid: txid,
           size: txData.vsize || txData.size || 0,
           vsize: txData.vsize || txData.size || 0,
-          fee: txData.fee || 0,
+          fee: txFee,
           value: Math.abs(totalValue), // Use absolute value
           time: txData.time || Math.floor(Date.now() / 1000),
           inputs: inputs,
@@ -849,16 +825,13 @@ async function sendMempoolDataToClient(ws) {
 3. Network connectivity issues with RPC server`);
         
         // Add basic transaction data even if enhanced data fails
-        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
-        let priority = 'low';
-        if (feeRate > 100) priority = 'high';
-        else if (feeRate > 50) priority = 'medium';
+        const { fee: txFee, fee_rate: feeRate, priority } = feeFields(mempoolEntryFee(txData), txData.vsize || txData.size);
         
         transactions.push({
           txid: txid,
           size: txData.vsize || txData.size || 0,
           vsize: txData.vsize || txData.size || 0,
-          fee: txData.fee || 0,
+          fee: txFee,
           value: 0,
           time: txData.time || Math.floor(Date.now() / 1000),
           inputs: [],
@@ -878,9 +851,7 @@ async function sendMempoolDataToClient(ws) {
     transactions.sort((a, b) => b.time - a.time);
     
     // Calculate average fee
-    const avgFee = transactions.length > 0 
-      ? transactions.reduce((sum, tx) => sum + tx.fee, 0) / transactions.length
-      : 0;
+    const avgFee = averageKnownFee(transactions);
     
     // Send enhanced data to client
     ws.send(JSON.stringify({
@@ -914,13 +885,7 @@ async function sendMempoolDataToClient(ws) {
           minfee: 0,
           avgfee: 0,
           totalfee: 0,
-          feeDistribution: {
-            '0-10': 0,
-            '10-50': 0,
-            '50-100': 0,
-            '100-500': 0,
-            '500+': 0
-          }
+          feeDistribution: emptyFeeDistribution()
         },
         transactions: []
       }
@@ -2876,14 +2841,9 @@ async function updateConfirmedTransactionsCache() {
               }));
             }
             
-            // More realistic fee estimation based on transaction size
+            // Real fee from getblock verbosity 2 (null when the node gives none)
             const txSize = tx.vsize || tx.size || (inputs.length * 148 + outputs.length * 34 + 10);
-            const estimatedFee = Math.max(0.00001, txSize * 0.00000050); // ~50 sat/byte
-            const feeRate = Math.round((estimatedFee * 100000000) / txSize);
-            
-            let priority = 'low';
-            if (feeRate > 100) priority = 'high';
-            else if (feeRate > 50) priority = 'medium';
+            const { fee: txFee, fee_rate: feeRate, priority } = feeFields(blockTxFee(tx), tx.vsize || tx.size);
             
             const confirmations = recentBlocks[0] ? (recentBlocks[0].height - fullBlock.height + 1) : 1;
             
@@ -2896,7 +2856,7 @@ async function updateConfirmedTransactionsCache() {
               value: totalValue,
               size: txSize,
               vsize: tx.vsize || txSize,
-              fee: estimatedFee,
+              fee: txFee,
               fee_rate: feeRate,
               priority: priority,
               inputs: inputs,
@@ -2983,13 +2943,7 @@ async function updateMempoolCache() {
     const transactions = [];
     const txIds = Object.keys(rawMempool || {});
     let totalFee = 0;
-    const feeDistribution = {
-      '0-10': 0,
-      '10-50': 0,
-      '50-100': 0,
-      '100-500': 0,
-      '500+': 0
-    };
+    const feeDistribution = emptyFeeDistribution();
     
     for (const txid of txIds.slice(0, 50)) {
       const txData = rawMempool[txid];
@@ -2997,17 +2951,9 @@ async function updateMempoolCache() {
       
       try {
         const enhancedTxData = await getTransactionData(txid);
-        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+        const { fee: txFee, fee_rate: feeRate, priority } = feeFields(mempoolEntryFee(txData), txData.vsize || txData.size);
         
-        if (feeRate < 10) feeDistribution['0-10']++;
-        else if (feeRate < 50) feeDistribution['10-50']++;
-        else if (feeRate < 100) feeDistribution['50-100']++;
-        else if (feeRate < 500) feeDistribution['100-500']++;
-        else feeDistribution['500+']++;
-        
-        let priority = 'low';
-        if (feeRate > 100) priority = 'high';
-        else if (feeRate > 50) priority = 'medium';
+        addToFeeDistribution(feeDistribution, feeRate);
         
         let totalValue = 0;
         let inputs = [];
@@ -3035,13 +2981,13 @@ async function updateMempoolCache() {
           }
         }
         
-        totalFee += txData.fee || 0;
+        totalFee += txFee || 0;
         
         transactions.push({
           txid: txid,
           size: txData.vsize || txData.size || 0,
           vsize: txData.vsize || txData.size || 0,
-          fee: txData.fee || 0,
+          fee: txFee,
           value: Math.abs(totalValue),
           time: txData.time || Math.floor(Date.now() / 1000),
           inputs: inputs,
@@ -3107,9 +3053,7 @@ async function updateMempoolCache() {
     
     displayTransactions.sort((a, b) => b.time - a.time);
     
-    const avgFee = transactions.length > 0 
-      ? transactions.reduce((sum, tx) => sum + tx.fee, 0) / transactions.length
-      : 0;
+    const avgFee = averageKnownFee(transactions);
     
     mempoolCache = {
       stats: {
@@ -3231,14 +3175,9 @@ async function updateTestnetConfirmedTransactionsCache() {
               }));
             }
 
-            // More realistic fee estimation based on transaction size
+            // Real fee from getblock verbosity 2 (null when the node gives none)
             const txSize = tx.vsize || tx.size || (inputs.length * 148 + outputs.length * 34 + 10);
-            const estimatedFee = Math.max(0.00001, txSize * 0.00000050); // ~50 sat/byte
-            const feeRate = Math.round((estimatedFee * 100000000) / txSize);
-
-            let priority = 'low';
-            if (feeRate > 100) priority = 'high';
-            else if (feeRate > 50) priority = 'medium';
+            const { fee: txFee, fee_rate: feeRate, priority } = feeFields(blockTxFee(tx), tx.vsize || tx.size);
 
             const confirmations = testnetRecentBlocks[0] ? (testnetRecentBlocks[0].height - fullBlock.height + 1) : 1;
 
@@ -3251,7 +3190,7 @@ async function updateTestnetConfirmedTransactionsCache() {
               value: totalValue,
               size: txSize,
               vsize: tx.vsize || txSize,
-              fee: estimatedFee,
+              fee: txFee,
               fee_rate: feeRate,
               priority: priority,
               inputs: inputs,
@@ -3327,13 +3266,7 @@ async function updateTestnetMempoolCache() {
     const transactions = [];
     const txIds = Object.keys(rawMempool || {});
     let totalFee = 0;
-    const feeDistribution = {
-      '0-10': 0,
-      '10-50': 0,
-      '50-100': 0,
-      '100-500': 0,
-      '500+': 0
-    };
+    const feeDistribution = emptyFeeDistribution();
 
     for (const txid of txIds.slice(0, 50)) {
       const txData = rawMempool[txid];
@@ -3348,17 +3281,9 @@ async function updateTestnetMempoolCache() {
           // Transaction may have been confirmed or dropped
         }
 
-        const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+        const { fee: txFee, fee_rate: feeRate, priority } = feeFields(mempoolEntryFee(txData), txData.vsize || txData.size);
 
-        if (feeRate < 10) feeDistribution['0-10']++;
-        else if (feeRate < 50) feeDistribution['10-50']++;
-        else if (feeRate < 100) feeDistribution['50-100']++;
-        else if (feeRate < 500) feeDistribution['100-500']++;
-        else feeDistribution['500+']++;
-
-        let priority = 'low';
-        if (feeRate > 100) priority = 'high';
-        else if (feeRate > 50) priority = 'medium';
+        addToFeeDistribution(feeDistribution, feeRate);
 
         let totalValue = 0;
         let inputs = [];
@@ -3386,13 +3311,13 @@ async function updateTestnetMempoolCache() {
           }
         }
 
-        totalFee += txData.fee || 0;
+        totalFee += txFee || 0;
 
         transactions.push({
           txid: txid,
           size: txData.vsize || txData.size || 0,
           vsize: txData.vsize || txData.size || 0,
-          fee: txData.fee || 0,
+          fee: txFee,
           value: Math.abs(totalValue),
           time: txData.time || Math.floor(Date.now() / 1000),
           inputs: inputs,
@@ -3458,9 +3383,7 @@ async function updateTestnetMempoolCache() {
 
     displayTransactions.sort((a, b) => b.time - a.time);
 
-    const avgFee = transactions.length > 0
-      ? transactions.reduce((sum, tx) => sum + tx.fee, 0) / transactions.length
-      : 0;
+    const avgFee = averageKnownFee(transactions);
 
     testnetMempoolCache = {
       stats: {
@@ -3587,15 +3510,9 @@ async function sendRecentTransactionsToClient(ws) {
               }));
             }
             
-            // Estimate fee (simple calculation)
-            const estimatedFee = 0.0001 * (inputs.length || 1);
+            // Real fee from getblock verbosity 2 (null when the node gives none)
             const txSize = tx.vsize || tx.size || 250; // Default size estimate
-            const feeRate = Math.round((estimatedFee * 100000000) / txSize);
-            
-            // Determine priority based on estimated fee rate
-            let priority = 'low';
-            if (feeRate > 100) priority = 'high';
-            else if (feeRate > 50) priority = 'medium';
+            const { fee: txFee, fee_rate: feeRate, priority } = feeFields(blockTxFee(tx), tx.vsize || tx.size);
             
             // Calculate confirmations
             const confirmations = recentBlocks[0] ? (recentBlocks[0].height - fullBlock.height + 1) : 1;
@@ -3609,7 +3526,7 @@ async function sendRecentTransactionsToClient(ws) {
               value: totalValue,
               size: txSize,
               vsize: tx.vsize || txSize,
-              fee: estimatedFee,
+              fee: txFee,
               fee_rate: feeRate,
               priority: priority,
               inputs: inputs,
@@ -3713,17 +3630,17 @@ async function monitorMempoolChanges() {
       for (const txid of newTxIds.slice(0, 10)) {
         if (rawMempool[txid]) {
           const txData = rawMempool[txid];
-          const feeRate = txData.fee ? Math.round((txData.fee * 100000000) / (txData.vsize || txData.size || 1)) : 0;
+          const { fee: txFee, fee_rate: feeRate, priority } = feeFields(mempoolEntryFee(txData), txData.vsize || txData.size);
           
           const newTx = {
             txid: txid,
             size: txData.vsize || txData.size || 0,
-            fee: txData.fee || 0,
+            fee: txFee,
             time: txData.time || Math.floor(Date.now() / 1000),
             inputs: txData.depends ? txData.depends.length : 1,
             outputs: 2,
             fee_rate: feeRate,
-            priority: feeRate > 100 ? 'high' : feeRate > 50 ? 'medium' : 'low'
+            priority: priority
           };
           
           // Broadcast to all clients
@@ -4158,16 +4075,22 @@ async function handleRawTransactions() {
           }
         }
         
-        // Calculate fee (would need input values for accurate fee)
-        const estimatedFee = 0.0001 * (txData.vin ? txData.vin.length : 1);
+        // Real fee from the mempool entry (unknown if the tx already left the mempool)
+        let mempoolEntry = null;
+        try {
+          mempoolEntry = await sendRpcRequest('getmempoolentry', [txid]);
+        } catch (e) {
+          // Mined or dropped already: fee stays unknown (null)
+        }
         const txSize = txData.vsize || txData.size || message.length / 2;
+        const { fee: txFee, fee_rate: feeRate } = feeFields(mempoolEntryFee(mempoolEntry), txData.vsize || txData.size);
         
         const newTransaction = {
           txid: txid,
           value: totalValue,
           size: txSize,
-          fee: estimatedFee,
-          feeRate: txSize > 0 ? Math.round((estimatedFee * 100000000) / txSize) : 0,
+          fee: txFee,
+          feeRate: feeRate,
           time: txData.time || Math.floor(Date.now() / 1000),
           inputs: txData.vin ? txData.vin.length : 0,
           outputs: txData.vout ? txData.vout.length : 0,
@@ -4282,7 +4205,8 @@ async function handleRawBlocks() {
           }
           
           const txSize = tx.vsize || tx.size || 0;
-          const estimatedFee = 0.0001 * (tx.vin ? tx.vin.length : 1);
+          // Real fee from getblock verbosity 2 (null when the node gives none)
+          const { fee: txFee, fee_rate: feeRate } = feeFields(blockTxFee(tx), txSize);
           
           blockTransactions.push({
             txid: tx.txid || tx.hash,
@@ -4291,8 +4215,8 @@ async function handleRawBlocks() {
             time: tx.time || fullBlock.time,
             value: totalValue,
             size: txSize,
-            fee: estimatedFee,
-            feeRate: txSize > 0 ? Math.round((estimatedFee * 100000000) / txSize) : 0,
+            fee: txFee,
+            feeRate: feeRate,
             inputs: tx.vin ? tx.vin.length : 0,
             outputs: tx.vout ? tx.vout.length : 0,
             confirmations: 1

@@ -70,7 +70,7 @@ function makeBlock(height) {
  * Minimal JSON-RPC node: a short chain plus any extra blocks the test registers.
  * Methods listed in `failMethods` answer with an RPC error.
  */
-function startMockRpc(chain, { failMethods = [] } = {}) {
+function startMockRpc(chain, { failMethods = [], extraHandlers = {} } = {}) {
   const byHash = new Map(chain.map((b) => [b.hash, b]));
   const byHeight = new Map(chain.map((b) => [b.height, b]));
   const tip = () => chain[chain.length - 1];
@@ -91,6 +91,7 @@ function startMockRpc(chain, { failMethods = [] } = {}) {
     getrawmempool: () => [],
     getmempoolinfo: () => ({ size: 0, bytes: 0, usage: 0, total_fee: 0 }),
     getchaintips: () => [{ height: tip().height, hash: tip().hash, branchlen: 0, status: 'active' }],
+    ...extraHandlers,
   };
 
   const server = http.createServer((req, res) => {
@@ -400,4 +401,131 @@ describe.skipIf(!HAS_CONFIG)('server.js process: getaddrmaninfo failure', () => 
   test('logs the peer refresh failure', () => {
     expect(server.output).toMatch(/Mainnet peer refresh failed: address-manager RPC \(getaddrmaninfo\) returned no data/);
   });
+});
+
+// FIRST-TIMER-1: "Recent Confirmed Transactions" showed a made-up fee
+// (vsize x 50 sat/vB) instead of the real one, and mempool rows showed 0
+// because v26 nodes put the fee in `fees.base`, not the old top-level `fee`.
+describe.skipIf(!HAS_CONFIG)('server.js process: real transaction fees', () => {
+  // Real mainnet tx 42f6ca23... (block 24,443,018): fee 2,000,000 sats, 426 vB.
+  const REAL_TX = {
+    txid: '42f6ca23192a4ebbc1572364769111ef85193ab9889f769599db0329b749245a',
+    size: 426, vsize: 426, weight: 1704,
+    vin: [{ txid: '572ff9d4dc4bcb340b59ab088e3b7694d02c6ed7775168df338302ebf5228eca', vout: 3 }],
+    vout: [{ value: 99.769, scriptPubKey: { address: 'DRGNhTiYdetetvRo3qnUFpo3PYUrVYPHZP', type: 'pubkeyhash' } }],
+    fee: 0.02,
+  };
+  // Same block shape but the node gave no fee (e.g. missing undo data).
+  const NO_FEE_TX = {
+    txid: 'cd'.repeat(32), size: 141, vsize: 141, weight: 564,
+    vin: [{ txid: 'ef'.repeat(32), vout: 0 }],
+    vout: [{ value: 1, scriptPubKey: { address: 'DEVdL6GVFSYSsJXKCvGVHT9fwASNv2YRzM', type: 'pubkeyhash' } }],
+  };
+  // `getrawmempool true` entry as Bitcoin Core 26 returns it: no top-level fee.
+  const MEMPOOL_TXID = 'ab'.repeat(32);
+  const MEMPOOL_ENTRY = {
+    vsize: 226, weight: 904, time: Math.floor(Date.now() / 1000), height: 5,
+    descendantcount: 1, descendantsize: 226, ancestorcount: 1, ancestorsize: 226,
+    wtxid: MEMPOOL_TXID,
+    fees: { base: 0.0226, modified: 0.0226, ancestor: 0.0226, descendant: 0.0226 },
+    depends: [], spentby: [], 'bip125-replaceable': false, unbroadcast: false,
+  };
+  const mempoolHandlers = {
+    getrawmempool: ([verbose]) => (verbose ? { [MEMPOOL_TXID]: MEMPOOL_ENTRY } : [MEMPOOL_TXID]),
+    getmempoolinfo: () => ({ size: 1, bytes: 226, usage: 1000, total_fee: 0.0226, mempoolminfee: 0.0001 }),
+    getmempoolentry: ([txid]) => (txid === MEMPOOL_TXID ? MEMPOOL_ENTRY : null),
+    getrawtransaction: ([txid]) => (txid === MEMPOOL_TXID ? {
+      txid, size: 226, vsize: 226,
+      vin: [{ txid: '12'.repeat(32), vout: 1 }],
+      vout: [{ value: 5, scriptPubKey: { address: 'DEVdL6GVFSYSsJXKCvGVHT9fwASNv2YRzM', type: 'pubkeyhash' } }],
+    } : null),
+  };
+
+  const chainWithTxs = () => {
+    const chain = [1, 2, 3, 4, 5].map((h) => makeBlock(h).block);
+    const tip = chain[chain.length - 1];
+    tip.tx.push(REAL_TX, NO_FEE_TX);
+    tip.nTx = tip.tx.length;
+    return chain;
+  };
+
+  let tmpDir;
+  let mainnetRpc;
+  let testnetRpc;
+  let server;
+  let ports;
+  const initial = { main: {}, test: {} };
+
+  /** Connect and keep the first message of each type the server sends. */
+  function collectInitial(port, into) {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+      ws.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (!(msg.type in into)) into[msg.type] = msg.data;
+          if ('recentTransactions' in into && 'mempool' in into) { ws.close(); resolve(); }
+        } catch { /* ignore non-JSON */ }
+      });
+      ws.once('error', reject);
+    });
+  }
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dgbstats-proc-'));
+    mainnetRpc = await startMockRpc(chainWithTxs(), { extraHandlers: mempoolHandlers });
+    testnetRpc = await startMockRpc(chainWithTxs(), { extraHandlers: mempoolHandlers });
+    ports = await allocatePorts();
+    server = spawnServer({
+      cwd: tmpDir,
+      env: serverEnv({ ports, mainnetUrl: mainnetRpc.url, testnetUrl: testnetRpc.url }),
+    });
+    await server.waitForLog(/✓ Confirmed transactions cache loaded/);
+    await server.waitForLog(/✓ Mempool cache loaded/);
+    await server.waitForLog(/✓ Testnet confirmed transactions cache loaded/);
+    await server.waitForLog(/✓ Testnet mempool cache loaded/);
+    await collectInitial(ports.ws, initial.main);
+    await collectInitial(ports.testnetWs, initial.test);
+  });
+
+  afterAll(async () => {
+    await server?.stop();
+    await mainnetRpc?.close();
+    await testnetRpc?.close();
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  for (const net of ['main', 'test']) {
+    describe(`${net}net`, () => {
+      test('confirmed tx shows the real fee from getblock verbosity 2', () => {
+        const tx = initial[net].recentTransactions.find((t) => t.txid === REAL_TX.txid);
+        expect(tx).toBeDefined();
+        expect(tx.fee).toBe(0.02);            // DGB, was 0.000213 (426 x 50 sat)
+        expect(tx.fee_rate).toBe(4695);       // sat/vB, matches DigiExplorer
+        expect(tx.priority).toBe('medium'); // 4,695 sat/vB on the DigiByte scale
+        expect(tx.size).toBe(426);
+        expect(tx.vsize).toBe(426);
+      });
+
+      test('confirmed tx with no fee field reports null, not a made-up number', () => {
+        const tx = initial[net].recentTransactions.find((t) => t.txid === NO_FEE_TX.txid);
+        expect(tx).toBeDefined();
+        expect(tx.fee).toBeNull();
+        expect(tx.fee_rate).toBeNull();
+        expect(tx.priority).toBe('unknown');
+      });
+
+      test('mempool tx shows the real fee from fees.base', () => {
+        const { transactions, stats } = initial[net].mempool;
+        const tx = transactions.find((t) => t.txid === MEMPOOL_TXID);
+        expect(tx).toBeDefined();
+        expect(tx.fee).toBe(0.0226);          // was 0 (read the removed `fee` field)
+        expect(tx.fee_rate).toBe(10000);
+        expect(tx.priority).toBe('high');   // 10,000 sat/vB on the DigiByte scale
+        expect(stats.totalfee).toBeCloseTo(0.0226, 10);
+        expect(stats.avgfee).toBeCloseTo(0.0226, 10);
+        expect(stats.feeDistribution['10000-50000']).toBe(1);
+      });
+    });
+  }
 });
