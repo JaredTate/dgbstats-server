@@ -63,7 +63,7 @@ const history = require('./history.js');
 
 const SERVER_CONFIG = {
   port: process.env.PORT || 5001,
-  wsPort: 5002,
+  wsPort: process.env.DGB_WS_PORT || 5002,
   testnetWsPort: process.env.DGB_TESTNET_WS_PORT || 5003,
   mainnetPreWsPort: process.env.DGB_MAINNET_PRE_WS_PORT || 5004,
   corsEnabled: true,
@@ -80,7 +80,7 @@ const ZMQ_CONFIG = {
   endpoints: {
     rawtx: 'tcp://127.0.0.1:28333',      // Raw transaction data
     hashtx: 'tcp://127.0.0.1:28335',     // Transaction hashes
-    rawblock: 'tcp://127.0.0.1:28332',   // Raw block data
+    rawblock: process.env.DGB_ZMQ_RAWBLOCK || 'tcp://127.0.0.1:28332',   // Raw block data
     hashblock: 'tcp://127.0.0.1:28334'   // Block hashes
   }
 };
@@ -312,31 +312,36 @@ const db = new sqlite3.Database('nodes.db');
 initializeDatabase();
 
 function initializeDatabase() {
-  // Node geolocation data table
-  db.run(`CREATE TABLE IF NOT EXISTS nodes (
-    ip TEXT PRIMARY KEY,
-    country TEXT,
-    city TEXT,
-    lat REAL,
-    lon REAL
-  )`);
+  // serialize(): sqlite3 runs statements in parallel by default, so on a fresh
+  // nodes.db the visits index (and early queries) could run before CREATE TABLE
+  // and crash startup with "no such table: visits".
+  db.serialize(() => {
+    // Node geolocation data table
+    db.run(`CREATE TABLE IF NOT EXISTS nodes (
+      ip TEXT PRIMARY KEY,
+      country TEXT,
+      city TEXT,
+      lat REAL,
+      lon REAL
+    )`);
 
-  // Visit tracking table
-  db.run(`CREATE TABLE IF NOT EXISTS visits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-  // Index the timestamp: /api/visitstats does `WHERE timestamp > datetime('now','-30 days')`.
-  // Without this index that is a full scan of the whole visits table (millions of rows),
-  // and because every DB call shares this single sqlite connection, a burst of visit-stats
-  // queries at startup starves the one-shot Phase 3 peer-persist and hangs the boot.
-  db.run('CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)');
+    // Visit tracking table
+    db.run(`CREATE TABLE IF NOT EXISTS visits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ip TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    // Index the timestamp: /api/visitstats does `WHERE timestamp > datetime('now','-30 days')`.
+    // Without this index that is a full scan of the whole visits table (millions of rows),
+    // and because every DB call shares this single sqlite connection, a burst of visit-stats
+    // queries at startup starves the one-shot Phase 3 peer-persist and hangs the boot.
+    db.run('CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)');
 
-  // Unique visitor tracking
-  db.run(`CREATE TABLE IF NOT EXISTS unique_ips (
-    ip TEXT PRIMARY KEY
-  )`);
+    // Unique visitor tracking
+    db.run(`CREATE TABLE IF NOT EXISTS unique_ips (
+      ip TEXT PRIMARY KEY
+    )`);
+  });
 
   // Crawler-owned table (crawled_nodes) — separate from the peers.dat-backed
   // `nodes` table, which is wiped on every 10-minute peer refresh
