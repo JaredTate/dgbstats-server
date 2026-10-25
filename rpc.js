@@ -1215,11 +1215,22 @@ router.get('/testnet/getdeploymentinfo', async (req, res) => {
   }
 });
 
+// Block lookups check their input before calling the node (WEIRD-INPUT-11):
+// a height is 1-9 digits, a block hash is 64 hex characters.
+const BLOCK_HEIGHT_RE = /^\d{1,9}$/;
+const BLOCK_HASH_RE = /^[0-9a-f]{64}$/i;
+
 // Testnet block hash by height
 router.get('/testnet/getblockhash/:height', async (req, res) => {
+  if (!BLOCK_HEIGHT_RE.test(req.params.height)) {
+    return res.status(400).json({ error: 'Invalid block height: use a whole number from 0 to 999999999' });
+  }
   try {
-    const height = parseInt(req.params.height, 10);
+    const height = Number(req.params.height);
     const data = await sendTestnetRpcRequest('getblockhash', [height]);
+    if (data === null || data === undefined) {
+      return res.status(404).json({ error: 'Block not found at this height' });
+    }
     res.json(data);
   } catch (error) {
     console.error('Error in /api/testnet/getblockhash:', error);
@@ -1229,8 +1240,14 @@ router.get('/testnet/getblockhash/:height', async (req, res) => {
 
 // Testnet block by hash
 router.get('/testnet/getblock/:hash', async (req, res) => {
+  if (!BLOCK_HASH_RE.test(req.params.hash)) {
+    return res.status(400).json({ error: 'Invalid block hash: use 64 hex characters' });
+  }
   try {
-    const data = await sendTestnetRpcRequest('getblock', [req.params.hash, 2]);
+    const data = await sendTestnetRpcRequest('getblock', [req.params.hash.toLowerCase(), 2]);
+    if (data === null || data === undefined) {
+      return res.status(404).json({ error: 'Block not found' });
+    }
     res.json(data);
   } catch (error) {
     console.error('Error in /api/testnet/getblock:', error);

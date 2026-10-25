@@ -479,10 +479,10 @@ wss.on('connection', (ws) => {
     clearInterval(pingTimer);
   });
 
-  // Handle connection errors
+  // Handle connection errors. ws always emits 'close' after 'error', and the
+  // 'close' handler counts the client out, so do not decrement here too.
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
-    connectedClients--;
     clearInterval(pingTimer);
   });
 });
@@ -586,8 +586,7 @@ wssTestnet.on('connection', (ws) => {
   // Handle connection errors
   ws.on('error', (error) => {
     console.error('Testnet WebSocket error:', error);
-    testnetConnectedClients--;
-    clearInterval(pingTimer);
+    clearInterval(pingTimer); // 'close' follows and counts the client out
   });
 });
 
@@ -645,8 +644,7 @@ wssMainnetPre.on('connection', (ws) => {
 
   ws.on('error', (error) => {
     console.error('Mainnet-PRE WebSocket error:', error);
-    mainnetPreConnectedClients--;
-    clearInterval(pingTimer);
+    clearInterval(pingTimer); // 'close' follows and counts the client out
   });
 });
 

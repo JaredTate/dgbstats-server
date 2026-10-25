@@ -529,3 +529,59 @@ describe.skipIf(!HAS_CONFIG)('server.js process: real transaction fees', () => {
     });
   }
 });
+
+// Break-it validation: on a socket error the server ran `connectedClients--`
+// in BOTH the 'error' and the 'close' handler, so the count drifted down
+// (/api/cachestatus showed 0 while pages were connected).
+describe.skipIf(!HAS_CONFIG)('server.js process: WebSocket client count', () => {
+  let tmpDir;
+  let mainnetRpc;
+  let testnetRpc;
+  let server;
+  let ports;
+  const clients = [];
+
+  const getJson = (port, urlPath) => new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: urlPath }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => resolve(JSON.parse(body)));
+    }).on('error', reject);
+  });
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dgbstats-proc-'));
+    const chain = () => [1, 2, 3, 4, 5].map((h) => makeBlock(h).block);
+    mainnetRpc = await startMockRpc(chain());
+    testnetRpc = await startMockRpc(chain());
+    ports = await allocatePorts();
+    server = spawnServer({
+      cwd: tmpDir,
+      env: serverEnv({ ports, mainnetUrl: mainnetRpc.url, testnetUrl: testnetRpc.url }),
+    });
+    await server.waitForLog(/ZeroMQ initialization complete/);
+  });
+
+  afterAll(async () => {
+    clients.forEach((c) => c.ws.terminate());
+    await server?.stop();
+    await mainnetRpc?.close();
+    await testnetRpc?.close();
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('a client that errors is counted out once, not twice', async () => {
+    clients.push(await openClient(ports.ws), await openClient(ports.ws), await openClient(ports.ws));
+    await sleep(300);
+    expect((await getJson(ports.http, '/api/cachestatus')).connections).toBe(3);
+
+    // An invalid frame (opcode 0xF) makes the server socket emit 'error', then 'close'.
+    const bad = clients.pop();
+    bad.ws.on('error', () => {});
+    bad.ws._socket.write(Buffer.from([0x8f, 0x80, 0, 0, 0, 0]));
+    await server.waitForLog(/WebSocket error/, 5000);
+    await sleep(500);
+
+    expect((await getJson(ports.http, '/api/cachestatus')).connections).toBe(2);
+  });
+});
